@@ -271,4 +271,4 @@ require (
 
 replace github.com/tendermint/tendermint => github.com/bnb-chain/tendermint v0.31.12
 
-replace github.com/VictoriaMetrics/metrics => github.com/greyireland/metrics v0.0.5
+replace github.com/VictoriaMetrics/metrics => github.com/ourzora/erigon-metrics v0.0.0-20230808214014-887c5bbc7969
