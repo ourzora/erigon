@@ -13,8 +13,8 @@ import (
 	"github.com/ledgerwatch/erigon/cmd/devnet/blocks"
 	"github.com/ledgerwatch/erigon/cmd/devnet/devnet"
 	"github.com/ledgerwatch/erigon/cmd/devnet/devnetutils"
-	"github.com/ledgerwatch/erigon/cmd/devnet/requests"
 	"github.com/ledgerwatch/erigon/cmd/devnet/scenarios"
+	"github.com/ledgerwatch/erigon/rpc"
 
 	"github.com/holiman/uint256"
 
@@ -41,7 +41,7 @@ func CheckTxPoolContent(ctx context.Context, expectedPendingSize, expectedQueued
 	}
 
 	if expectedPendingSize >= 0 && pendingSize != expectedPendingSize {
-		logger.Error("FAILURE mismatched pending subpool size", "expected", expectedPendingSize, "got", pendingSize)
+		logger.Debug("FAILURE mismatched pending subpool size", "expected", expectedPendingSize, "got", pendingSize)
 		return
 	}
 
@@ -51,7 +51,7 @@ func CheckTxPoolContent(ctx context.Context, expectedPendingSize, expectedQueued
 	}
 
 	if expectedBaseFeeSize >= 0 && baseFeeSize != expectedBaseFeeSize {
-		logger.Error("FAILURE mismatched basefee subpool size", "expected", expectedBaseFeeSize, "got", baseFeeSize)
+		logger.Debug("FAILURE mismatched basefee subpool size", "expected", expectedBaseFeeSize, "got", baseFeeSize)
 	}
 
 	logger.Info("Subpool sizes", "pending", pendingSize, "queued", queuedSize, "basefee", baseFeeSize)
@@ -219,7 +219,7 @@ func CreateTransaction(node devnet.Node, to, from string, value uint64) (types.T
 		return nil, libcommon.Address{}, fmt.Errorf("Unknown from account: %s", from)
 	}
 
-	res, err := node.GetTransactionCount(fromAccount.Address, requests.BlockNumbers.Pending)
+	res, err := node.GetTransactionCount(fromAccount.Address, rpc.PendingBlock)
 
 	if err != nil {
 		return nil, libcommon.Address{}, fmt.Errorf("failed to get transaction count for address 0x%x: %v", fromAccount.Address, err)
@@ -241,7 +241,7 @@ func CreateTransaction(node devnet.Node, to, from string, value uint64) (types.T
 func signEIP1559TxsLowerAndHigherThanBaseFee2(ctx context.Context, amountLower, amountHigher int, baseFeePerGas uint64, toAddress libcommon.Address, fromAddress libcommon.Address) ([]types.Transaction, []types.Transaction, error) {
 	node := devnet.SelectNode(ctx)
 
-	res, err := node.GetTransactionCount(fromAddress, requests.BlockNumbers.Pending)
+	res, err := node.GetTransactionCount(fromAddress, rpc.PendingBlock)
 
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get transaction count for address 0x%x: %v", fromAddress, err)
@@ -335,7 +335,12 @@ func signEIP1559TxsHigherThanBaseFee(ctx context.Context, n int, baseFeePerGas u
 
 		devnet.Logger(ctx).Info("HIGHER", "transaction", i, "nonce", transaction.Nonce, "value", transaction.Value, "feecap", transaction.FeeCap)
 
-		signedTransaction, err := types.SignTx(transaction, signer, accounts.SigKey(fromAddress))
+		signerKey := accounts.SigKey(fromAddress)
+		if signerKey == nil {
+			return nil, fmt.Errorf("devnet.signEIP1559TxsHigherThanBaseFee failed to SignTx: private key not found for address %s", fromAddress)
+		}
+
+		signedTransaction, err := types.SignTx(transaction, signer, signerKey)
 		if err != nil {
 			return nil, err
 		}

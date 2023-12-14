@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/ledgerwatch/erigon-lib/common/hexutil"
+
 	ethereum "github.com/ledgerwatch/erigon"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/common/hexutility"
@@ -18,8 +20,8 @@ import (
 	"github.com/ledgerwatch/erigon/cmd/devnet/requests"
 	"github.com/ledgerwatch/erigon/cmd/devnet/scenarios"
 	"github.com/ledgerwatch/erigon/cmd/devnet/transactions"
-	"github.com/ledgerwatch/erigon/common/hexutil"
 	"github.com/ledgerwatch/erigon/core/types"
+	"github.com/ledgerwatch/erigon/rpc"
 )
 
 func init() {
@@ -60,7 +62,7 @@ func DeployAndCallLogSubscriber(ctx context.Context, deployer string) (*libcommo
 
 	blockNum := txToBlockMap[eventHash]
 
-	block, err := node.GetBlockByNumber(blockNum, true)
+	block, err := node.GetBlockByNumber(ctx, rpc.AsBlockNumber(blockNum), true)
 
 	if err != nil {
 		return nil, err
@@ -126,7 +128,7 @@ func EmitFallbackEvent(node devnet.Node, subContract *contracts.Subscription, op
 
 // initializeTransactOps initializes the transactOpts object for a contract transaction
 func initializeTransactOps(node devnet.Node, transactor libcommon.Address) (*bind.TransactOpts, error) {
-	count, err := node.GetTransactionCount(transactor, requests.BlockNumbers.Latest)
+	count, err := node.GetTransactionCount(transactor, rpc.LatestBlock)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to get transaction count for address 0x%x: %v", transactor, err)

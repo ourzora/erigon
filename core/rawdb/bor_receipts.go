@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/ledgerwatch/erigon-lib/kv/dbutils"
 	"math/big"
 
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
@@ -11,7 +12,6 @@ import (
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/log/v3"
 
-	"github.com/ledgerwatch/erigon/common/dbutils"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/ethdb/cbor"
 	"github.com/ledgerwatch/erigon/rlp"
@@ -164,7 +164,7 @@ func ReadBorTransaction(db kv.Tx, borTxHash libcommon.Hash) (types.Transaction, 
 	return borTx, err
 }
 
-func ReadBorTxLookupEntry(db kv.Tx, borTxHash libcommon.Hash) (*uint64, error) {
+func ReadBorTxLookupEntry(db kv.Getter, borTxHash libcommon.Hash) (*uint64, error) {
 	blockNumBytes, err := db.GetOne(kv.BorTxLookup, borTxHash.Bytes())
 	if err != nil {
 		return nil, err

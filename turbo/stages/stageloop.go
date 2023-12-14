@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/arc/v2"
 	"github.com/holiman/uint256"
 	"github.com/ledgerwatch/log/v3"
 
@@ -16,13 +17,13 @@ import (
 	"github.com/ledgerwatch/erigon-lib/common/dbg"
 	proto_downloader "github.com/ledgerwatch/erigon-lib/gointerfaces/downloader"
 	"github.com/ledgerwatch/erigon-lib/kv"
-	"github.com/ledgerwatch/erigon-lib/kv/memdb"
+	"github.com/ledgerwatch/erigon-lib/kv/membatchwithdb"
 	"github.com/ledgerwatch/erigon-lib/state"
-	"github.com/ledgerwatch/erigon/consensus"
-	"github.com/ledgerwatch/erigon/turbo/engineapi/engine_helpers"
-	"github.com/ledgerwatch/erigon/turbo/services"
 
-	"github.com/ledgerwatch/erigon/cmd/sentry/sentry"
+	"github.com/ledgerwatch/erigon/consensus"
+	"github.com/ledgerwatch/erigon/consensus/bor"
+	"github.com/ledgerwatch/erigon/consensus/bor/finality/flags"
+	"github.com/ledgerwatch/erigon/consensus/bor/heimdall"
 	"github.com/ledgerwatch/erigon/consensus/misc"
 	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/core/rawdb/blockio"
@@ -32,7 +33,11 @@ import (
 	"github.com/ledgerwatch/erigon/eth/stagedsync"
 	"github.com/ledgerwatch/erigon/eth/stagedsync/stages"
 	"github.com/ledgerwatch/erigon/p2p"
+	"github.com/ledgerwatch/erigon/p2p/sentry/sentry_multi_client"
+	"github.com/ledgerwatch/erigon/turbo/engineapi/engine_helpers"
+	"github.com/ledgerwatch/erigon/turbo/services"
 	"github.com/ledgerwatch/erigon/turbo/shards"
+	"github.com/ledgerwatch/erigon/turbo/silkworm"
 	"github.com/ledgerwatch/erigon/turbo/stages/bodydownload"
 	"github.com/ledgerwatch/erigon/turbo/stages/headerdownload"
 )
@@ -47,6 +52,7 @@ func StageLoop(ctx context.Context,
 	logger log.Logger,
 	blockReader services.FullBlockReader,
 	hook *Hook,
+	forcePartialCommit bool,
 ) {
 	defer close(waitForDone)
 	initialCycle := true
@@ -62,7 +68,7 @@ func StageLoop(ctx context.Context,
 		}
 
 		// Estimate the current top height seen from the peer
-		err := StageLoopIteration(ctx, db, nil, sync, initialCycle, logger, blockReader, hook)
+		err := StageLoopIteration(ctx, db, nil, sync, initialCycle, logger, blockReader, hook, forcePartialCommit)
 
 		if err != nil {
 			if errors.Is(err, libcommon.ErrStopped) || errors.Is(err, context.Canceled) {
@@ -93,7 +99,7 @@ func StageLoop(ctx context.Context,
 	}
 }
 
-func StageLoopIteration(ctx context.Context, db kv.RwDB, tx kv.RwTx, sync *stagedsync.Sync, initialCycle bool, logger log.Logger, blockReader services.FullBlockReader, hook *Hook) (err error) {
+func StageLoopIteration(ctx context.Context, db kv.RwDB, tx kv.RwTx, sync *stagedsync.Sync, initialCycle bool, logger log.Logger, blockReader services.FullBlockReader, hook *Hook, forcePartialCommit bool) (err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("%+v, trace: %s", rec, dbg.Stack())
@@ -101,7 +107,7 @@ func StageLoopIteration(ctx context.Context, db kv.RwDB, tx kv.RwTx, sync *stage
 	}() // avoid crash because Erigon's core does many things
 
 	externalTx := tx != nil
-	finishProgressBefore, headersProgressBefore, err := stagesHeadersAndFinish(db, tx)
+	finishProgressBefore, borProgressBefore, headersProgressBefore, err := stagesHeadersAndFinish(db, tx)
 	if err != nil {
 		return err
 	}
@@ -109,9 +115,15 @@ func StageLoopIteration(ctx context.Context, db kv.RwDB, tx kv.RwTx, sync *stage
 	// In all other cases - process blocks batch in 1 RwTx
 	// 2 corner-cases: when sync with --snapshots=false and when executed only blocks from snapshots (in this case all stages progress is equal and > 0, but node is not synced)
 	isSynced := finishProgressBefore > 0 && finishProgressBefore > blockReader.FrozenBlocks() && finishProgressBefore == headersProgressBefore
+	if blockReader.BorSnapshots() != nil {
+		isSynced = isSynced && borProgressBefore > blockReader.FrozenBorBlocks()
+	}
 	canRunCycleInOneTransaction := isSynced
 	if externalTx {
 		canRunCycleInOneTransaction = true
+	}
+	if forcePartialCommit {
+		canRunCycleInOneTransaction = false
 	}
 
 	// Main steps:
@@ -153,21 +165,8 @@ func StageLoopIteration(ctx context.Context, db kv.RwDB, tx kv.RwTx, sync *stage
 	}
 
 	// -- send notifications START
-	if externalTx {
-		if hook != nil {
-			if err = hook.AfterRun(tx, finishProgressBefore); err != nil {
-				return err
-			}
-		}
-	} else {
-		if err := db.View(ctx, func(tx kv.Tx) error {
-			if hook != nil {
-				if err = hook.AfterRun(tx, finishProgressBefore); err != nil {
-					return err
-				}
-			}
-			return nil
-		}); err != nil {
+	if hook != nil {
+		if err = hook.AfterRun(tx, finishProgressBefore); err != nil {
 			return err
 		}
 	}
@@ -196,15 +195,18 @@ func stageLoopStepPrune(ctx context.Context, db kv.RwDB, tx kv.RwTx, sync *stage
 	return db.Update(ctx, func(tx kv.RwTx) error { return sync.RunPrune(db, tx, initialCycle) })
 }
 
-func stagesHeadersAndFinish(db kv.RoDB, tx kv.Tx) (head, fin uint64, err error) {
+func stagesHeadersAndFinish(db kv.RoDB, tx kv.Tx) (head, bor, fin uint64, err error) {
 	if tx != nil {
 		if fin, err = stages.GetStageProgress(tx, stages.Finish); err != nil {
-			return head, fin, err
+			return head, bor, fin, err
 		}
 		if head, err = stages.GetStageProgress(tx, stages.Headers); err != nil {
-			return head, fin, err
+			return head, bor, fin, err
 		}
-		return head, fin, nil
+		if bor, err = stages.GetStageProgress(tx, stages.BorHeimdall); err != nil {
+			return head, bor, fin, err
+		}
+		return head, bor, fin, nil
 	}
 	if err := db.View(context.Background(), func(tx kv.Tx) error {
 		if fin, err = stages.GetStageProgress(tx, stages.Finish); err != nil {
@@ -213,11 +215,14 @@ func stagesHeadersAndFinish(db kv.RoDB, tx kv.Tx) (head, fin uint64, err error) 
 		if head, err = stages.GetStageProgress(tx, stages.Headers); err != nil {
 			return err
 		}
+		if bor, err = stages.GetStageProgress(tx, stages.BorHeimdall); err != nil {
+			return err
+		}
 		return nil
 	}); err != nil {
-		return head, fin, err
+		return head, bor, fin, err
 	}
-	return head, fin, nil
+	return head, bor, fin, nil
 }
 
 type Hook struct {
@@ -228,12 +233,13 @@ type Hook struct {
 	logger        log.Logger
 	blockReader   services.FullBlockReader
 	updateHead    func(ctx context.Context, headHeight uint64, headTime uint64, hash libcommon.Hash, td *uint256.Int)
+	db            kv.RoDB
 }
 
-func NewHook(ctx context.Context, notifications *shards.Notifications, sync *stagedsync.Sync, blockReader services.FullBlockReader, chainConfig *chain.Config, logger log.Logger, updateHead func(ctx context.Context, headHeight uint64, headTime uint64, hash libcommon.Hash, td *uint256.Int)) *Hook {
-	return &Hook{ctx: ctx, notifications: notifications, sync: sync, blockReader: blockReader, chainConfig: chainConfig, logger: logger, updateHead: updateHead}
+func NewHook(ctx context.Context, db kv.RoDB, notifications *shards.Notifications, sync *stagedsync.Sync, blockReader services.FullBlockReader, chainConfig *chain.Config, logger log.Logger, updateHead func(ctx context.Context, headHeight uint64, headTime uint64, hash libcommon.Hash, td *uint256.Int)) *Hook {
+	return &Hook{ctx: ctx, db: db, notifications: notifications, sync: sync, blockReader: blockReader, chainConfig: chainConfig, logger: logger, updateHead: updateHead}
 }
-func (h *Hook) BeforeRun(tx kv.Tx, inSync bool) error {
+func (h *Hook) beforeRun(tx kv.Tx, inSync bool) error {
 	notifications := h.notifications
 	if notifications != nil && notifications.Accumulator != nil && inSync {
 		stateVersion, err := rawdb.GetStateVersion(tx)
@@ -244,16 +250,28 @@ func (h *Hook) BeforeRun(tx kv.Tx, inSync bool) error {
 	}
 	return nil
 }
+func (h *Hook) BeforeRun(tx kv.Tx, inSync bool) error {
+	if tx == nil {
+		return h.db.View(h.ctx, func(tx kv.Tx) error { return h.beforeRun(tx, inSync) })
+	}
+	return h.beforeRun(tx, inSync)
+}
 func (h *Hook) AfterRun(tx kv.Tx, finishProgressBefore uint64) error {
+	if tx == nil {
+		return h.db.View(h.ctx, func(tx kv.Tx) error { return h.afterRun(tx, finishProgressBefore) })
+	}
+	return h.afterRun(tx, finishProgressBefore)
+}
+func (h *Hook) afterRun(tx kv.Tx, finishProgressBefore uint64) error {
 	notifications := h.notifications
 	blockReader := h.blockReader
 	// -- send notifications START
 	//TODO: can this 2 headers be 1
-	var headHeader, currentHeder *types.Header
+	var headHeader, currentHeader *types.Header
 
 	// Update sentry status for peers to see our sync status
 	var headTd *big.Int
-	var plainStateVersion uint64
+	var plainStateVersion, finalizedBlock uint64
 	head, err := stages.GetStageProgress(tx, stages.Headers)
 	if err != nil {
 		return err
@@ -266,14 +284,19 @@ func (h *Hook) AfterRun(tx kv.Tx, finishProgressBefore uint64) error {
 		return err
 	}
 	headHeader = rawdb.ReadHeader(tx, headHash, head)
-	currentHeder = rawdb.ReadCurrentHeader(tx)
-
+	currentHeader = rawdb.ReadCurrentHeader(tx)
+	finalizedHeaderHash := rawdb.ReadForkchoiceFinalized(tx)
+	if fb := rawdb.ReadHeaderNumber(tx, finalizedHeaderHash); fb != nil {
+		finalizedBlock = *fb
+	}
 	// update the accumulator with a new plain state version so the cache can be notified that
 	// state has moved on
 	if plainStateVersion, err = rawdb.GetStateVersion(tx); err != nil {
 		return err
 	}
-	notifications.Accumulator.SetStateID(plainStateVersion)
+	if notifications != nil && notifications.Accumulator != nil {
+		notifications.Accumulator.SetStateID(plainStateVersion)
+	}
 
 	if headTd != nil && headHeader != nil {
 		headTd256, overflow := uint256.FromBig(headTd)
@@ -288,14 +311,23 @@ func (h *Hook) AfterRun(tx kv.Tx, finishProgressBefore uint64) error {
 			return nil
 		}
 	}
-	if notifications != nil && notifications.Accumulator != nil && currentHeder != nil {
+	if notifications != nil && notifications.Accumulator != nil && currentHeader != nil {
 
-		pendingBaseFee := misc.CalcBaseFee(h.chainConfig, currentHeder)
-		if currentHeder.Number.Uint64() == 0 {
-			notifications.Accumulator.StartChange(0, currentHeder.Hash(), nil, false)
+		pendingBaseFee := misc.CalcBaseFee(h.chainConfig, currentHeader)
+		if currentHeader.Number.Uint64() == 0 {
+			notifications.Accumulator.StartChange(0, currentHeader.Hash(), nil, false)
+		}
+		pendingBlobFee := h.chainConfig.GetMinBlobGasPrice()
+		if currentHeader.ExcessBlobGas != nil {
+			excessBlobGas := misc.CalcExcessBlobGas(h.chainConfig, currentHeader)
+			f, err := misc.GetBlobGasPrice(h.chainConfig, excessBlobGas)
+			if err != nil {
+				return err
+			}
+			pendingBlobFee = f.Uint64()
 		}
 
-		notifications.Accumulator.SendAndReset(h.ctx, notifications.StateChangesConsumer, pendingBaseFee.Uint64(), currentHeder.GasLimit)
+		notifications.Accumulator.SendAndReset(h.ctx, notifications.StateChangesConsumer, pendingBaseFee.Uint64(), pendingBlobFee, currentHeader.GasLimit, finalizedBlock)
 	}
 	// -- send notifications END
 	return nil
@@ -314,7 +346,7 @@ func MiningStep(ctx context.Context, kv kv.RwDB, mining *stagedsync.Sync, tmpDir
 	}
 	defer tx.Rollback()
 
-	miningBatch := memdb.NewMemoryBatch(tx, tmpDir)
+	miningBatch := membatchwithdb.NewMemoryBatch(tx, tmpDir)
 	defer miningBatch.Rollback()
 
 	if err = mining.Run(nil, miningBatch, false /* firstCycle */); err != nil {
@@ -324,7 +356,49 @@ func MiningStep(ctx context.Context, kv kv.RwDB, mining *stagedsync.Sync, tmpDir
 	return nil
 }
 
-func StateStep(ctx context.Context, chainReader consensus.ChainHeaderReader, engine consensus.Engine, batch kv.RwTx, blockWriter *blockio.BlockWriter, stateSync *stagedsync.Sync, Bd *bodydownload.BodyDownload, header *types.Header, body *types.RawBody, unwindPoint uint64, headersChain []*types.Header, bodiesChain []*types.RawBody) (err error) {
+func addAndVerifyBlockStep(batch kv.RwTx, engine consensus.Engine, chainReader consensus.ChainReader, currentHeader *types.Header, currentBody *types.RawBody, histV3 bool) error {
+	currentHeight := currentHeader.Number.Uint64()
+	currentHash := currentHeader.Hash()
+	if chainReader != nil {
+		if err := engine.VerifyHeader(chainReader, currentHeader, true); err != nil {
+			log.Warn("Header Verification Failed", "number", currentHeight, "hash", currentHash, "reason", err)
+			return fmt.Errorf("%w: %v", consensus.ErrInvalidBlock, err)
+		}
+		if err := engine.VerifyUncles(chainReader, currentHeader, currentBody.Uncles); err != nil {
+			log.Warn("Unlcles Verification Failed", "number", currentHeight, "hash", currentHash, "reason", err)
+			return fmt.Errorf("%w: %v", consensus.ErrInvalidBlock, err)
+		}
+	}
+	// Prepare memory state for block execution
+	if err := rawdb.WriteHeader(batch, currentHeader); err != nil {
+		return err
+	}
+	if err := rawdb.WriteCanonicalHash(batch, currentHash, currentHeight); err != nil {
+		return err
+	}
+	if err := rawdb.WriteHeadHeaderHash(batch, currentHash); err != nil {
+		return err
+	}
+	var ok bool
+	var err error
+	if ok, err = rawdb.WriteRawBodyIfNotExists(batch, currentHash, currentHeight, currentBody); err != nil {
+		return err
+	}
+	if histV3 && ok {
+		if err := rawdb.AppendCanonicalTxNums(batch, currentHeight); err != nil {
+			return err
+		}
+	}
+	if err := stages.SaveStageProgress(batch, stages.Headers, currentHeight); err != nil {
+		return err
+	}
+	if err := stages.SaveStageProgress(batch, stages.Bodies, currentHeight); err != nil {
+		return err
+	}
+	return nil
+}
+
+func StateStep(ctx context.Context, chainReader consensus.ChainReader, engine consensus.Engine, batch kv.RwTx, blockWriter *blockio.BlockWriter, stateSync *stagedsync.Sync, Bd *bodydownload.BodyDownload, header *types.Header, body *types.RawBody, unwindPoint uint64, headersChain []*types.Header, bodiesChain []*types.RawBody, histV3 bool) (err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("%+v, trace: %s", rec, dbg.Stack())
@@ -334,39 +408,20 @@ func StateStep(ctx context.Context, chainReader consensus.ChainHeaderReader, eng
 	// Construct side fork if we have one
 	if unwindPoint > 0 {
 		// Run it through the unwind
-		stateSync.UnwindTo(unwindPoint, libcommon.Hash{})
+		stateSync.UnwindTo(unwindPoint, stagedsync.StagedUnwind)
 		if err = stateSync.RunUnwind(nil, batch); err != nil {
 			return err
 		}
+	}
+	if err := rawdb.TruncateCanonicalChain(ctx, batch, header.Number.Uint64()+1); err != nil {
+		return err
 	}
 	// Once we unwound we can start constructing the chain (assumption: len(headersChain) == len(bodiesChain))
 	for i := range headersChain {
 		currentHeader := headersChain[i]
 		currentBody := bodiesChain[i]
-		currentHeight := headersChain[i].Number.Uint64()
-		currentHash := headersChain[i].Hash()
-		if chainReader != nil {
-			if err := engine.VerifyHeader(chainReader, currentHeader, true); err != nil {
-				log.Warn("Header Verification Failed", "number", currentHeight, "hash", currentHash, "reason", err)
-				return err
-			}
-		}
 
-		// Prepare memory state for block execution
-		if err := rawdb.WriteHeader(batch, currentHeader); err != nil {
-			return err
-		}
-		if currentBody != nil {
-			Bd.AddToPrefetch(currentHeader, currentBody)
-		}
-
-		if err := rawdb.WriteCanonicalHash(batch, currentHash, currentHeight); err != nil {
-			return err
-		}
-		if err := rawdb.WriteHeadHeaderHash(batch, currentHash); err != nil {
-			return err
-		}
-		if err = stages.SaveStageProgress(batch, stages.Headers, currentHeight); err != nil {
+		if err := addAndVerifyBlockStep(batch, engine, chainReader, currentHeader, currentBody, histV3); err != nil {
 			return err
 		}
 		// Run state sync
@@ -379,29 +434,9 @@ func StateStep(ctx context.Context, chainReader consensus.ChainHeaderReader, eng
 	if header == nil {
 		return nil
 	}
-	if err := engine.VerifyHeader(chainReader, header, true); err != nil {
-		log.Warn("Header Verification Failed", "number", header.Number.Uint64(), "hash", header.Hash(), "reason", err)
-		return err
-	}
-
-	// Setup
-	height := header.Number.Uint64()
-	hash := header.Hash()
 	// Prepare memory state for block execution
-	if err = rawdb.WriteHeader(batch, header); err != nil {
+	if err := addAndVerifyBlockStep(batch, engine, chainReader, header, body, histV3); err != nil {
 		return err
-	}
-	if err = rawdb.WriteCanonicalHash(batch, hash, height); err != nil {
-		return err
-	}
-	if err := rawdb.WriteHeadHeaderHash(batch, hash); err != nil {
-		return err
-	}
-	if err = stages.SaveStageProgress(batch, stages.Headers, height); err != nil {
-		return err
-	}
-	if body != nil {
-		Bd.AddToPrefetch(header, body)
 	}
 	// Run state sync
 	if err = stateSync.RunNoInterrupt(nil, batch, false /* firstCycle */); err != nil {
@@ -410,17 +445,29 @@ func StateStep(ctx context.Context, chainReader consensus.ChainHeaderReader, eng
 	return nil
 }
 
+func silkwormForExecutionStage(silkworm *silkworm.Silkworm, cfg *ethconfig.Config) *silkworm.Silkworm {
+	if cfg.SilkwormExecution {
+		return silkworm
+	}
+	return nil
+}
+
 func NewDefaultStages(ctx context.Context,
 	db kv.RwDB,
+	snapDb kv.RwDB,
 	p2pCfg p2p.Config,
 	cfg *ethconfig.Config,
-	controlServer *sentry.MultiClient,
+	controlServer *sentry_multi_client.MultiClient,
 	notifications *shards.Notifications,
 	snapDownloader proto_downloader.DownloaderClient,
 	blockReader services.FullBlockReader,
 	blockRetire services.BlockRetire,
 	agg *state.AggregatorV3,
+	silkworm *silkworm.Silkworm,
 	forkValidator *engine_helpers.ForkValidator,
+	heimdallClient heimdall.IHeimdallClient,
+	recents *lru.ARCCache[libcommon.Hash, *bor.Snapshot],
+	signatures *lru.ARCCache[libcommon.Hash, libcommon.Address],
 	logger log.Logger,
 ) []*stagedsync.Stage {
 	dirs := cfg.Dirs
@@ -430,9 +477,16 @@ func NewDefaultStages(ctx context.Context,
 	// Hence we run it in the test mode.
 	runInTestMode := cfg.ImportMode
 
+	var loopBreakCheck func() bool
+
+	if heimdallClient != nil && flags.Milestone {
+		loopBreakCheck = heimdall.MilestoneRewindPending
+	}
+
 	return stagedsync.DefaultStages(ctx,
-		stagedsync.StageSnapshotsCfg(db, *controlServer.ChainConfig, dirs, blockRetire, snapDownloader, blockReader, notifications.Events, cfg.HistoryV3, agg),
-		stagedsync.StageHeadersCfg(db, controlServer.Hd, controlServer.Bd, *controlServer.ChainConfig, controlServer.SendHeaderRequest, controlServer.PropagateNewBlockHashes, controlServer.Penalize, cfg.BatchSize, p2pCfg.NoDiscovery, blockReader, blockWriter, dirs.Tmp, notifications, forkValidator),
+		stagedsync.StageSnapshotsCfg(db, *controlServer.ChainConfig, dirs, blockRetire, snapDownloader, blockReader, notifications.Events, cfg.HistoryV3, agg, cfg.InternalCL && cfg.CaplinConfig.Backfilling, silkworm),
+		stagedsync.StageHeadersCfg(db, controlServer.Hd, controlServer.Bd, *controlServer.ChainConfig, controlServer.SendHeaderRequest, controlServer.PropagateNewBlockHashes, controlServer.Penalize, cfg.BatchSize, p2pCfg.NoDiscovery, blockReader, blockWriter, dirs.Tmp, notifications, forkValidator, loopBreakCheck),
+		stagedsync.StageBorHeimdallCfg(db, snapDb, stagedsync.MiningState{}, *controlServer.ChainConfig, heimdallClient, blockReader, controlServer.Hd, controlServer.Penalize, recents, signatures),
 		stagedsync.StageBlockHashesCfg(db, dirs.Tmp, controlServer.ChainConfig, blockWriter),
 		stagedsync.StageBodiesCfg(db, controlServer.Bd, controlServer.SendBodyRequest, controlServer.Penalize, controlServer.BroadcastNewBlock, cfg.Sync.BodyDownloadTimeoutSeconds, *controlServer.ChainConfig, blockReader, cfg.HistoryV3, blockWriter),
 		stagedsync.StageSendersCfg(db, controlServer.ChainConfig, false, dirs.Tmp, cfg.Prune, blockReader, controlServer.Hd),
@@ -454,6 +508,7 @@ func NewDefaultStages(ctx context.Context,
 			cfg.Genesis,
 			cfg.Sync,
 			agg,
+			silkwormForExecutionStage(silkworm, cfg),
 		),
 		stagedsync.StageHashStateCfg(db, dirs, cfg.HistoryV3),
 		stagedsync.StageTrieCfg(db, true, true, false, dirs.Tmp, blockReader, controlServer.Hd, cfg.HistoryV3, agg),
@@ -468,12 +523,13 @@ func NewDefaultStages(ctx context.Context,
 func NewPipelineStages(ctx context.Context,
 	db kv.RwDB,
 	cfg *ethconfig.Config,
-	controlServer *sentry.MultiClient,
+	controlServer *sentry_multi_client.MultiClient,
 	notifications *shards.Notifications,
 	snapDownloader proto_downloader.DownloaderClient,
 	blockReader services.FullBlockReader,
 	blockRetire services.BlockRetire,
 	agg *state.AggregatorV3,
+	silkworm *silkworm.Silkworm,
 	forkValidator *engine_helpers.ForkValidator,
 	logger log.Logger,
 	checkStateRoot bool,
@@ -486,7 +542,7 @@ func NewPipelineStages(ctx context.Context,
 	runInTestMode := cfg.ImportMode
 
 	return stagedsync.PipelineStages(ctx,
-		stagedsync.StageSnapshotsCfg(db, *controlServer.ChainConfig, dirs, blockRetire, snapDownloader, blockReader, notifications.Events, cfg.HistoryV3, agg),
+		stagedsync.StageSnapshotsCfg(db, *controlServer.ChainConfig, dirs, blockRetire, snapDownloader, blockReader, notifications.Events, cfg.HistoryV3, agg, cfg.InternalCL && cfg.CaplinConfig.Backfilling, silkworm),
 		stagedsync.StageBlockHashesCfg(db, dirs.Tmp, controlServer.ChainConfig, blockWriter),
 		stagedsync.StageSendersCfg(db, controlServer.ChainConfig, false, dirs.Tmp, cfg.Prune, blockReader, controlServer.Hd),
 		stagedsync.StageExecuteBlocksCfg(
@@ -507,6 +563,7 @@ func NewPipelineStages(ctx context.Context,
 			cfg.Genesis,
 			cfg.Sync,
 			agg,
+			silkwormForExecutionStage(silkworm, cfg),
 		),
 		stagedsync.StageHashStateCfg(db, dirs, cfg.HistoryV3),
 		stagedsync.StageTrieCfg(db, checkStateRoot, true, false, dirs.Tmp, blockReader, controlServer.Hd, cfg.HistoryV3, agg),
@@ -518,12 +575,12 @@ func NewPipelineStages(ctx context.Context,
 		runInTestMode)
 }
 
-func NewInMemoryExecution(ctx context.Context, db kv.RwDB, cfg *ethconfig.Config, controlServer *sentry.MultiClient,
+func NewInMemoryExecution(ctx context.Context, db kv.RwDB, cfg *ethconfig.Config, controlServer *sentry_multi_client.MultiClient,
 	dirs datadir.Dirs, notifications *shards.Notifications, blockReader services.FullBlockReader, blockWriter *blockio.BlockWriter, agg *state.AggregatorV3,
-	logger log.Logger) (*stagedsync.Sync, error) {
+	silkworm *silkworm.Silkworm, logger log.Logger) *stagedsync.Sync {
 	return stagedsync.New(
 		stagedsync.StateStages(ctx,
-			stagedsync.StageHeadersCfg(db, controlServer.Hd, controlServer.Bd, *controlServer.ChainConfig, controlServer.SendHeaderRequest, controlServer.PropagateNewBlockHashes, controlServer.Penalize, cfg.BatchSize, false, blockReader, blockWriter, dirs.Tmp, nil, nil),
+			stagedsync.StageHeadersCfg(db, controlServer.Hd, controlServer.Bd, *controlServer.ChainConfig, controlServer.SendHeaderRequest, controlServer.PropagateNewBlockHashes, controlServer.Penalize, cfg.BatchSize, false, blockReader, blockWriter, dirs.Tmp, nil, nil, nil),
 			stagedsync.StageBodiesCfg(db, controlServer.Bd, controlServer.SendBodyRequest, controlServer.Penalize, controlServer.BroadcastNewBlock, cfg.Sync.BodyDownloadTimeoutSeconds, *controlServer.ChainConfig, blockReader, cfg.HistoryV3, blockWriter),
 			stagedsync.StageBlockHashesCfg(db, dirs.Tmp, controlServer.ChainConfig, blockWriter),
 			stagedsync.StageSendersCfg(db, controlServer.ChainConfig, true, dirs.Tmp, cfg.Prune, blockReader, controlServer.Hd),
@@ -545,11 +602,12 @@ func NewInMemoryExecution(ctx context.Context, db kv.RwDB, cfg *ethconfig.Config
 				cfg.Genesis,
 				cfg.Sync,
 				agg,
+				silkwormForExecutionStage(silkworm, cfg),
 			),
 			stagedsync.StageHashStateCfg(db, dirs, cfg.HistoryV3),
 			stagedsync.StageTrieCfg(db, true, true, true, dirs.Tmp, blockReader, controlServer.Hd, cfg.HistoryV3, agg)),
 		stagedsync.StateUnwindOrder,
 		nil, /* pruneOrder */
 		logger,
-	), nil
+	)
 }

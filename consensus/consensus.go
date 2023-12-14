@@ -27,6 +27,7 @@ import (
 
 	"github.com/ledgerwatch/erigon/core/state"
 	"github.com/ledgerwatch/erigon/core/types"
+	"github.com/ledgerwatch/erigon/rlp"
 	"github.com/ledgerwatch/erigon/rpc"
 	"github.com/ledgerwatch/log/v3"
 )
@@ -54,6 +55,9 @@ type ChainHeaderReader interface {
 
 	// Number of blocks frozen in the block snapshots
 	FrozenBlocks() uint64
+
+	// Byte string representation of a bor span with given ID
+	BorSpan(spanId uint64) []byte
 }
 
 // ChainReader defines a small collection of methods needed to access the local
@@ -63,9 +67,10 @@ type ChainReader interface {
 
 	// GetBlock retrieves a block from the database by hash and number.
 	GetBlock(hash libcommon.Hash, number uint64) *types.Block
-	GetHeader(hash libcommon.Hash, number uint64) *types.Header
 
 	HasBlock(hash libcommon.Hash, number uint64) bool
+
+	BorEventsByBlock(hash libcommon.Hash, number uint64) []rlp.RawValue
 }
 
 type SystemCall func(contract libcommon.Address, data []byte) ([]byte, error)
@@ -117,6 +122,9 @@ type EngineReader interface {
 
 	CalculateRewards(config *chain.Config, header *types.Header, uncles []*types.Header, syscall SystemCall,
 	) ([]Reward, error)
+
+	// Close terminates any background threads, DB's etc maintained by the consensus engine.
+	Close() error
 }
 
 // EngineReader are write methods of the consensus engine
@@ -136,7 +144,7 @@ type EngineWriter interface {
 
 	// Initialize runs any pre-transaction state modifications (e.g. epoch start)
 	Initialize(config *chain.Config, chain ChainHeaderReader, header *types.Header,
-		state *state.IntraBlockState, txs []types.Transaction, uncles []*types.Header, syscall SysCallCustom)
+		state *state.IntraBlockState, syscall SysCallCustom, logger log.Logger)
 
 	// Finalize runs any post-transaction state modifications (e.g. block rewards)
 	// but does not assemble the block.
@@ -145,7 +153,7 @@ type EngineWriter interface {
 	// consensus rules that happen at finalization (e.g. block rewards).
 	Finalize(config *chain.Config, header *types.Header, state *state.IntraBlockState,
 		txs types.Transactions, uncles []*types.Header, receipts types.Receipts, withdrawals []*types.Withdrawal,
-		chain ChainHeaderReader, syscall SystemCall, logger log.Logger,
+		chain ChainReader, syscall SystemCall, logger log.Logger,
 	) (types.Transactions, types.Receipts, error)
 
 	// FinalizeAndAssemble runs any post-transaction state modifications (e.g. block
@@ -155,7 +163,7 @@ type EngineWriter interface {
 	// consensus rules that happen at finalization (e.g. block rewards).
 	FinalizeAndAssemble(config *chain.Config, header *types.Header, state *state.IntraBlockState,
 		txs types.Transactions, uncles []*types.Header, receipts types.Receipts, withdrawals []*types.Withdrawal,
-		chain ChainHeaderReader, syscall SystemCall, call Call, logger log.Logger,
+		chain ChainReader, syscall SystemCall, call Call, logger log.Logger,
 	) (*types.Block, types.Transactions, types.Receipts, error)
 
 	// Seal generates a new sealing request for the given input block and pushes
@@ -177,9 +185,6 @@ type EngineWriter interface {
 
 	// APIs returns the RPC APIs this consensus engine provides.
 	APIs(chain ChainHeaderReader) []rpc.API
-
-	// Close terminates any background threads maintained by the consensus engine.
-	Close() error
 }
 
 // PoW is a consensus engine based on proof-of-work.

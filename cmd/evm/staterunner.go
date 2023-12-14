@@ -25,10 +25,10 @@ import (
 	"path/filepath"
 
 	"github.com/c2h5oh/datasize"
+	mdbx2 "github.com/erigontech/mdbx-go/mdbx"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/kv/mdbx"
 	"github.com/ledgerwatch/log/v3"
-	mdbx2 "github.com/torquem-ch/mdbx-go/mdbx"
 	"github.com/urfave/cli/v2"
 
 	"github.com/ledgerwatch/erigon/core/state"
@@ -57,8 +57,12 @@ type StatetestResult struct {
 }
 
 func stateTestCmd(ctx *cli.Context) error {
-	// Configure the go-ethereum logger
-	log.Root().SetHandler(log.LvlFilterHandler(log.LvlDebug, log.StderrHandler))
+	machineFriendlyOutput := ctx.Bool(MachineFlag.Name)
+	if machineFriendlyOutput {
+		log.Root().SetHandler(log.DiscardHandler())
+	} else {
+		log.Root().SetHandler(log.LvlFilterHandler(log.LvlInfo, log.StderrHandler))
+	}
 
 	// Configure the EVM logger
 	config := &logger.LogConfig{
@@ -70,7 +74,7 @@ func stateTestCmd(ctx *cli.Context) error {
 	cfg := vm.Config{
 		Debug: ctx.Bool(DebugFlag.Name) || ctx.Bool(MachineFlag.Name),
 	}
-	if ctx.Bool(MachineFlag.Name) {
+	if machineFriendlyOutput {
 		cfg.Tracer = logger.NewJSONLogger(config, os.Stderr)
 	} else if ctx.Bool(DebugFlag.Name) {
 		cfg.Tracer = logger.NewStructLogger(config)

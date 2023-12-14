@@ -1,14 +1,15 @@
 package consensus_tests
 
 import (
+	"github.com/ledgerwatch/erigon/spectest"
 	"io/fs"
 	"os"
 	"testing"
 
 	"github.com/ledgerwatch/erigon/cl/abstract"
+	"github.com/ledgerwatch/erigon/cl/phase1/core/state"
 	"github.com/ledgerwatch/erigon/cl/transition/impl/eth2/statechange"
 
-	"github.com/ledgerwatch/erigon/spectest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -65,11 +66,11 @@ var historicalRootsUpdateTest = NewEpochProcessing(func(s abstract.BeaconState) 
 })
 
 var inactivityUpdateTest = NewEpochProcessing(func(s abstract.BeaconState) error {
-	return statechange.ProcessInactivityScores(s)
+	return statechange.ProcessInactivityScores(s, state.EligibleValidatorsIndicies(s), statechange.GetUnslashedIndiciesSet(s))
 })
 
 var justificationFinalizationTest = NewEpochProcessing(func(s abstract.BeaconState) error {
-	return statechange.ProcessJustificationBitsAndFinality(s)
+	return statechange.ProcessJustificationBitsAndFinality(s, nil)
 })
 
 var participationFlagUpdatesTest = NewEpochProcessing(func(s abstract.BeaconState) error {
@@ -90,7 +91,7 @@ var registryUpdatesTest = NewEpochProcessing(func(s abstract.BeaconState) error 
 })
 
 var rewardsAndPenaltiesTest = NewEpochProcessing(func(s abstract.BeaconState) error {
-	return statechange.ProcessRewardsAndPenalties(s)
+	return statechange.ProcessRewardsAndPenalties(s, state.EligibleValidatorsIndicies(s), statechange.GetUnslashedIndiciesSet(s))
 })
 
 var slashingsTest = NewEpochProcessing(func(s abstract.BeaconState) error {

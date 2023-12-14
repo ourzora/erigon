@@ -17,7 +17,7 @@ About "key-value-style": Modern key-value databases don't provide Get/Put/Delete
 // And show which classes satisfy which interfaces.
 
                     +-----------------------------------+   +-----------------------------------+ 
-                    |  github.com/torquem-ch/mdbx-go    |   | google.golang.org/grpc.ClientConn |                    
+                    |  github.com/erigontech/mdbx-go    |   | google.golang.org/grpc.ClientConn |                    
                     |  (app-agnostic MDBX go bindings)  |   | (app-agnostic RPC and streaming)  |
                     +-----------------------------------+   +-----------------------------------+
                                       |                                      |
@@ -127,7 +127,7 @@ for k, v, err := c.First(); k != nil; k, v, err = c.Next() {
 - method Begin DOESN'T create new TxDb object, it means this object can be passed into other objects by pointer,
   and high-level app code can start/commit transactions when it needs without re-creating all objects which holds
   TxDb pointer.
-- This is the reason why txDb.CommitAndBegin() method works: inside it creating new transaction object, pinter to TxDb stays valid.
+- This is the reason why txDb.CommitAndBegin() method works: inside it creating new transaction object, pointer to TxDb stays valid.
 
 ## How to dump/load table
 

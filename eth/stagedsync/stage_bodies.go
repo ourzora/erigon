@@ -196,7 +196,7 @@ func BodiesForward(
 			err = cfg.bd.Engine.VerifyUncles(cr, header, rawBody.Uncles)
 			if err != nil {
 				logger.Error(fmt.Sprintf("[%s] Uncle verification failed", logPrefix), "number", blockHeight, "hash", header.Hash().String(), "err", err)
-				u.UnwindTo(blockHeight-1, header.Hash())
+				u.UnwindTo(blockHeight-1, BadBlock(header.Hash(), fmt.Errorf("Uncle verification failed: %w", err)))
 				return true, nil
 			}
 
@@ -342,24 +342,6 @@ func UnwindBodiesStage(u *UnwindState, tx kv.RwTx, cfg BodiesCfg, ctx context.Co
 	if err = u.Done(tx); err != nil {
 		return err
 	}
-	if !useExternalTx {
-		if err = tx.Commit(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func PruneBodiesStage(s *PruneState, tx kv.RwTx, cfg BodiesCfg, ctx context.Context) (err error) {
-	useExternalTx := tx != nil
-	if !useExternalTx {
-		tx, err = cfg.db.BeginRw(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-	}
-
 	if !useExternalTx {
 		if err = tx.Commit(); err != nil {
 			return err

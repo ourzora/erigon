@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/ledgerwatch/erigon/cl/abstract"
 	"reflect"
 	"time"
 
+	"github.com/ledgerwatch/erigon-lib/metrics"
+	"github.com/ledgerwatch/erigon/cl/abstract"
+
 	"github.com/ledgerwatch/erigon/cl/transition/impl/eth2/statechange"
-	"github.com/ledgerwatch/erigon/metrics/methelp"
 	"golang.org/x/exp/slices"
 
 	"github.com/ledgerwatch/erigon-lib/common"
@@ -38,16 +39,8 @@ func (I *impl) ProcessProposerSlashing(s abstract.BeaconState, propSlashing *clt
 		return fmt.Errorf("non-matching proposer indices proposer slashing: %d != %d", h1.ProposerIndex, h2.ProposerIndex)
 	}
 
-	h1Root, err := h1.HashSSZ()
-	if err != nil {
-		return fmt.Errorf("unable to hash header1: %v", err)
-	}
-	h2Root, err := h2.HashSSZ()
-	if err != nil {
-		return fmt.Errorf("unable to hash header2: %v", err)
-	}
-	if h1Root == h2Root {
-		return fmt.Errorf("propose slashing headers are the same: %v == %v", h1Root, h2Root)
+	if *h1 == *h2 {
+		return fmt.Errorf("proposee slashing headers are the same")
 	}
 
 	proposer, err := s.ValidatorForValidatorIndex(int(h1.ProposerIndex))
@@ -172,7 +165,7 @@ func (I *impl) ProcessDeposit(s abstract.BeaconState, deposit *cltypes.Deposit) 
 		if err != nil {
 			return err
 		}
-		signedRoot := utils.Keccak256(depositMessageRoot[:], domain)
+		signedRoot := utils.Sha256(depositMessageRoot[:], domain)
 		// Perform BLS verification and if successful noice.
 		valid, err := bls.Verify(deposit.Data.Signature[:], signedRoot[:], publicKey[:])
 		// Literally you can input it trash.
@@ -197,7 +190,7 @@ func (I *impl) ProcessDeposit(s abstract.BeaconState, deposit *cltypes.Deposit) 
 // ProcessVoluntaryExit takes a voluntary exit and applies state transition.
 func (I *impl) ProcessVoluntaryExit(s abstract.BeaconState, signedVoluntaryExit *cltypes.SignedVoluntaryExit) error {
 	// Sanity checks so that we know it is good.
-	voluntaryExit := signedVoluntaryExit.VolunaryExit
+	voluntaryExit := signedVoluntaryExit.VoluntaryExit
 	currentEpoch := state.Epoch(s)
 	validator, err := s.ValidatorForValidatorIndex(int(voluntaryExit.ValidatorIndex))
 	if err != nil {
@@ -241,7 +234,7 @@ func (I *impl) ProcessVoluntaryExit(s abstract.BeaconState, signedVoluntaryExit 
 
 // ProcessWithdrawals processes withdrawals by decreasing the balance of each validator
 // and updating the next withdrawal index and validator index.
-func (I *impl) ProcessWithdrawals(s abstract.BeaconState, withdrawals *solid.ListSSZ[*types.Withdrawal]) error {
+func (I *impl) ProcessWithdrawals(s abstract.BeaconState, withdrawals *solid.ListSSZ[*cltypes.Withdrawal]) error {
 	// Get the list of withdrawals, the expected withdrawals (if performing full validation),
 	// and the beacon configuration.
 	beaconConfig := s.BeaconConfig()
@@ -253,8 +246,8 @@ func (I *impl) ProcessWithdrawals(s abstract.BeaconState, withdrawals *solid.Lis
 		if len(expectedWithdrawals) != withdrawals.Len() {
 			return fmt.Errorf("ProcessWithdrawals: expected %d withdrawals, but got %d", len(expectedWithdrawals), withdrawals.Len())
 		}
-		if err := solid.RangeErr[*types.Withdrawal](withdrawals, func(i int, w *types.Withdrawal, _ int) error {
-			if !expectedWithdrawals[i].Equal(w) {
+		if err := solid.RangeErr[*cltypes.Withdrawal](withdrawals, func(i int, w *cltypes.Withdrawal, _ int) error {
+			if *expectedWithdrawals[i] != *w {
 				return fmt.Errorf("ProcessWithdrawals: withdrawal %d does not match expected withdrawal", i)
 			}
 			return nil
@@ -263,7 +256,7 @@ func (I *impl) ProcessWithdrawals(s abstract.BeaconState, withdrawals *solid.Lis
 		}
 	}
 
-	if err := solid.RangeErr[*types.Withdrawal](withdrawals, func(_ int, w *types.Withdrawal, _ int) error {
+	if err := solid.RangeErr[*cltypes.Withdrawal](withdrawals, func(_ int, w *cltypes.Withdrawal, _ int) error {
 		if err := state.DecreaseBalance(s, w.Validator, w.Amount); err != nil {
 			return err
 		}
@@ -327,7 +320,7 @@ func (I *impl) ProcessSyncAggregate(s abstract.BeaconState, sync *cltypes.SyncAg
 		if err != nil {
 			return err
 		}
-		msg := utils.Keccak256(blockRoot[:], domain)
+		msg := utils.Sha256(blockRoot[:], domain)
 		isValid, err := bls.VerifyAggregate(sync.SyncCommiteeSignature[:], msg[:], votedKeys)
 		if err != nil {
 			return err
@@ -372,7 +365,7 @@ func processSyncAggregate(s abstract.BeaconState, sync *cltypes.SyncAggregate) (
 			vIdx, exists := s.ValidatorIndexByPubkey(committeeKeys[currPubKeyIndex])
 			// Impossible scenario.
 			if !exists {
-				return nil, errors.New("validator public key does not exist in state")
+				return nil, fmt.Errorf("validator public key does not exist in state: %x", committeeKeys[currPubKeyIndex])
 			}
 			if syncAggregateBits[i]&byte(bit) > 0 {
 				votedKeys = append(votedKeys, committeeKeys[currPubKeyIndex][:])
@@ -411,7 +404,7 @@ func (I *impl) ProcessBlsToExecutionChange(s abstract.BeaconState, signedChange 
 		}
 
 		// Check the validator's withdrawal credentials against the provided message.
-		hashedFrom := utils.Keccak256(change.From[:])
+		hashedFrom := utils.Sha256(change.From[:])
 		if !bytes.Equal(hashedFrom[1:], wc[1:]) {
 			return fmt.Errorf("invalid withdrawal credentials")
 		}
@@ -479,7 +472,7 @@ func (I *impl) VerifyKzgCommitmentsAgainstTransactions(transactions *solid.Trans
 
 func (I *impl) ProcessAttestations(s abstract.BeaconState, attestations *solid.ListSSZ[*solid.Attestation]) error {
 	attestingIndiciesSet := make([][]uint64, attestations.Len())
-	h := methelp.NewHistTimer("beacon_process_attestations")
+	h := metrics.NewHistTimer("beacon_process_attestations")
 	baseRewardPerIncrement := s.BaseRewardPerIncrement()
 
 	c := h.Tag("attestation_step", "process")
@@ -518,10 +511,10 @@ func processAttestationPostAltair(s abstract.BeaconState, attestation *solid.Att
 	stateSlot := s.Slot()
 	beaconConfig := s.BeaconConfig()
 
-	h := methelp.NewHistTimer("beacon_process_attestation_post_altair")
+	h := metrics.NewHistTimer("beacon_process_attestation_post_altair")
 
 	c := h.Tag("step", "get_participation_flag")
-	participationFlagsIndicies, err := s.GetAttestationParticipationFlagIndicies(attestation.AttestantionData(), stateSlot-data.Slot())
+	participationFlagsIndicies, err := s.GetAttestationParticipationFlagIndicies(data, stateSlot-data.Slot(), false)
 	if err != nil {
 		return nil, err
 	}
@@ -529,7 +522,7 @@ func processAttestationPostAltair(s abstract.BeaconState, attestation *solid.Att
 
 	c = h.Tag("step", "get_attesting_indices")
 
-	attestingIndicies, err := s.GetAttestingIndicies(attestation.AttestantionData(), attestation.AggregationBits(), true)
+	attestingIndicies, err := s.GetAttestingIndicies(data, attestation.AggregationBits(), true)
 	if err != nil {
 		return nil, err
 	}
@@ -707,8 +700,12 @@ func processAttestation(s abstract.BeaconState, attestation *solid.Attestation, 
 
 func verifyAttestations(s abstract.BeaconState, attestations *solid.ListSSZ[*solid.Attestation], attestingIndicies [][]uint64) (bool, error) {
 	indexedAttestations := make([]*cltypes.IndexedAttestation, 0, attestations.Len())
+	commonBuffer := make([]byte, 8*2048)
 	attestations.Range(func(idx int, a *solid.Attestation, _ int) bool {
-		indexedAttestations = append(indexedAttestations, state.GetIndexedAttestation(a, attestingIndicies[idx]))
+		idxAttestations := state.GetIndexedAttestation(a, attestingIndicies[idx])
+		idxAttestations.AttestingIndices.SetReusableHashBuffer(commonBuffer)
+		idxAttestations.HashSSZ()
+		indexedAttestations = append(indexedAttestations, idxAttestations)
 		return true
 	})
 
@@ -817,7 +814,7 @@ func (I *impl) ProcessRandao(s abstract.BeaconState, randao [96]byte, proposerIn
 	}
 
 	randaoMixes := s.GetRandaoMixes(epoch)
-	randaoHash := utils.Keccak256(randao[:])
+	randaoHash := utils.Sha256(randao[:])
 	mix := [32]byte{}
 	for i := range mix {
 		mix[i] = randaoMixes[i] ^ randaoHash[i]
@@ -849,7 +846,7 @@ func (I *impl) ProcessSlots(s abstract.BeaconState, slot uint64) error {
 	beaconConfig := s.BeaconConfig()
 	sSlot := s.Slot()
 	if slot <= sSlot {
-		return fmt.Errorf("new slot: %d not greater than s slot: %d", slot, sSlot)
+		return fmt.Errorf("new slot: %d not greater than current slot: %d", slot, sSlot)
 	}
 	// Process each slot.
 	for i := sSlot; i < slot; i++ {
@@ -857,15 +854,15 @@ func (I *impl) ProcessSlots(s abstract.BeaconState, slot uint64) error {
 		if err != nil {
 			return fmt.Errorf("unable to process slot transition: %v", err)
 		}
-		// TODO(Someone): Add epoch transition.
+
 		if (sSlot+1)%beaconConfig.SlotsPerEpoch == 0 {
 			start := time.Now()
 			if err := statechange.ProcessEpoch(s); err != nil {
 				return err
 			}
-			log.Debug("Processed new epoch successfully", "epoch", state.Epoch(s), "process_epoch_elpsed", time.Since(start))
+			log.Trace("Processed new epoch successfully", "epoch", state.Epoch(s), "process_epoch_elpsed", time.Since(start))
 		}
-		// TODO: add logic to process epoch updates.
+
 		sSlot += 1
 		s.SetSlot(sSlot)
 		if sSlot%beaconConfig.SlotsPerEpoch != 0 {

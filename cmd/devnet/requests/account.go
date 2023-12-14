@@ -1,23 +1,15 @@
 package requests
 
 import (
+	"context"
 	"fmt"
 	"math/big"
 
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon-lib/common/hexutil"
 	"github.com/ledgerwatch/erigon-lib/common/hexutility"
-	"github.com/ledgerwatch/erigon/common/hexutil"
+	"github.com/ledgerwatch/erigon/rpc"
 )
-
-type EthBalance struct {
-	CommonResponse
-	Balance hexutil.Big `json:"result"`
-}
-
-type EthCode struct {
-	CommonResponse
-	Code hexutility.Bytes `json:"result"`
-}
 
 type DebugAccountAt struct {
 	CommonResponse
@@ -42,71 +34,41 @@ type StorageResult struct {
 	Proof []string     `json:"proof"`
 }
 
-func (reqGen *requestGenerator) GetCode(address libcommon.Address, blockRef BlockNumber) (hexutility.Bytes, error) {
-	var b EthCode
+func (reqGen *requestGenerator) GetCode(address libcommon.Address, blockRef rpc.BlockReference) (hexutility.Bytes, error) {
+	var result hexutility.Bytes
 
-	method, body := reqGen.getCode(address, blockRef)
-	if res := reqGen.call(method, body, &b); res.Err != nil {
-		return hexutility.Bytes{}, fmt.Errorf("failed to get code: %w", res.Err)
+	if err := reqGen.rpcCall(context.Background(), &result, Methods.ETHGetCode, address, blockRef); err != nil {
+		return nil, err
 	}
 
-	if b.Error != nil {
-		return hexutility.Bytes{}, fmt.Errorf("Failed to get code: rpc failed: %w", b.Error)
-	}
-
-	return b.Code, nil
+	return result, nil
 }
 
-func (req *requestGenerator) getCode(address libcommon.Address, blockRef BlockNumber) (RPCMethod, string) {
-	const template = `{"jsonrpc":"2.0","method":%q,"params":["0x%x","%s"],"id":%d}`
-	return Methods.ETHGetCode, fmt.Sprintf(template, Methods.ETHGetCode, address, blockRef, req.reqID)
-}
+func (reqGen *requestGenerator) GetBalance(address libcommon.Address, blockRef rpc.BlockReference) (*big.Int, error) {
+	var result hexutil.Big
 
-func (reqGen *requestGenerator) GetBalance(address libcommon.Address, blockNum BlockNumber) (*big.Int, error) {
-	var b EthBalance
-
-	method, body := reqGen.getBalance(address, blockNum)
-	if res := reqGen.call(method, body, &b); res.Err != nil {
-		return &big.Int{}, fmt.Errorf("failed to get balance: %w", res.Err)
+	if err := reqGen.rpcCall(context.Background(), &result, Methods.ETHGetBalance, address, blockRef); err != nil {
+		return nil, err
 	}
 
-	if b.Error != nil {
-		return &big.Int{}, fmt.Errorf("Failed to get balance: rpc failed: %w", b.Error)
-	}
-
-	return b.Balance.ToInt(), nil
+	return result.ToInt(), nil
 }
 
-func (req *requestGenerator) getBalance(address libcommon.Address, blockNum BlockNumber) (RPCMethod, string) {
-	const template = `{"jsonrpc":"2.0","method":%q,"params":["0x%x","%v"],"id":%d}`
-	return Methods.ETHGetBalance, fmt.Sprintf(template, Methods.ETHGetBalance, address, blockNum, req.reqID)
-}
+func (reqGen *requestGenerator) GetTransactionCount(address libcommon.Address, blockRef rpc.BlockReference) (*big.Int, error) {
+	var result hexutil.Big
 
-func (reqGen *requestGenerator) GetTransactionCount(address libcommon.Address, blockNum BlockNumber) (*big.Int, error) {
-	var b EthGetTransactionCount
-
-	method, body := reqGen.getTransactionCount(address, blockNum)
-	if res := reqGen.call(method, body, &b); res.Err != nil {
-		return nil, fmt.Errorf("error getting transaction count: %w", res.Err)
+	if err := reqGen.rpcCall(context.Background(), &result, Methods.ETHGetTransactionCount, address, blockRef); err != nil {
+		return nil, err
 	}
 
-	if b.Error != nil {
-		return nil, fmt.Errorf("error populating response object: %w", b.Error)
-	}
-
-	return big.NewInt(int64(b.Result)), nil
-}
-
-func (req *requestGenerator) getTransactionCount(address libcommon.Address, blockNum BlockNumber) (RPCMethod, string) {
-	const template = `{"jsonrpc":"2.0","method":%q,"params":["0x%x","%v"],"id":%d}`
-	return Methods.ETHGetTransactionCount, fmt.Sprintf(template, Methods.ETHGetTransactionCount, address, blockNum, req.reqID)
+	return result.ToInt(), nil
 }
 
 func (reqGen *requestGenerator) DebugAccountAt(blockHash libcommon.Hash, txIndex uint64, account libcommon.Address) (*AccountResult, error) {
 	var b DebugAccountAt
 
 	method, body := reqGen.debugAccountAt(blockHash, txIndex, account)
-	if res := reqGen.call(method, body, &b); res.Err != nil {
+	if res := reqGen.rpcCallJSON(method, body, &b); res.Err != nil {
 		return nil, fmt.Errorf("failed to get account: %v", res.Err)
 	}
 

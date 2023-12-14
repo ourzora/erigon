@@ -2,11 +2,13 @@ package bor_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"testing"
 
 	"github.com/ledgerwatch/erigon-lib/chain"
+	"github.com/ledgerwatch/erigon-lib/common"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/gointerfaces/sentry"
 	"github.com/ledgerwatch/erigon-lib/kv/memdb"
@@ -15,6 +17,7 @@ import (
 	"github.com/ledgerwatch/erigon/consensus/bor/clerk"
 	"github.com/ledgerwatch/erigon/consensus/bor/contract"
 	"github.com/ledgerwatch/erigon/consensus/bor/heimdall/checkpoint"
+	"github.com/ledgerwatch/erigon/consensus/bor/heimdall/milestone"
 	"github.com/ledgerwatch/erigon/consensus/bor/heimdall/span"
 	"github.com/ledgerwatch/erigon/consensus/bor/valset"
 	"github.com/ledgerwatch/erigon/core"
@@ -102,12 +105,32 @@ func (h test_heimdall) FetchCheckpointCount(ctx context.Context) (int64, error) 
 	return 0, fmt.Errorf("TODO")
 }
 
+func (h test_heimdall) FetchMilestone(ctx context.Context) (*milestone.Milestone, error) {
+	return nil, fmt.Errorf("TODO")
+}
+
+func (h test_heimdall) FetchMilestoneCount(ctx context.Context) (int64, error) {
+	return 0, fmt.Errorf("TODO")
+}
+
+func (h test_heimdall) FetchNoAckMilestone(ctx context.Context, milestoneID string) error {
+	return fmt.Errorf("TODO")
+}
+
+func (h test_heimdall) FetchLastNoAckMilestone(ctx context.Context) (string, error) {
+	return "", fmt.Errorf("TODO")
+}
+
+func (h test_heimdall) FetchMilestoneID(ctx context.Context, milestoneID string) error {
+	return fmt.Errorf("TODO")
+}
+
 func (h test_heimdall) Close() {}
 
 type test_genesisContract struct {
 }
 
-func (g test_genesisContract) CommitState(event *clerk.EventRecordWithTime, syscall consensus.SystemCall) error {
+func (g test_genesisContract) CommitState(event rlp.RawValue, syscall consensus.SystemCall) error {
 	return nil
 }
 
@@ -152,9 +175,15 @@ func (r headerReader) GetTd(libcommon.Hash, uint64) *big.Int {
 	return nil
 }
 
+func (r headerReader) BorSpan(spanId uint64) []byte {
+	b, _ := json.Marshal(&r.validator.heimdall.currentSpan)
+	return b
+}
+
 type spanner struct {
 	*span.ChainSpanner
-	currentSpan span.Span
+	validatorAddress common.Address
+	currentSpan      span.Span
 }
 
 func (c spanner) GetCurrentSpan(_ consensus.SystemCall) (*span.Span, error) {
@@ -164,6 +193,16 @@ func (c spanner) GetCurrentSpan(_ consensus.SystemCall) (*span.Span, error) {
 func (c *spanner) CommitSpan(heimdallSpan span.HeimdallSpan, syscall consensus.SystemCall) error {
 	c.currentSpan = heimdallSpan.Span
 	return nil
+}
+
+func (c *spanner) GetCurrentValidators(spanId uint64, signer libcommon.Address, chain consensus.ChainHeaderReader) ([]*valset.Validator, error) {
+	return []*valset.Validator{
+		{
+			ID:               1,
+			Address:          c.validatorAddress,
+			VotingPower:      1000,
+			ProposerPriority: 1,
+		}}, nil
 }
 
 type validator struct {
@@ -179,13 +218,11 @@ func (v validator) generateChain(length int) (*core.ChainPack, error) {
 }
 
 func (v validator) IsProposer(block *types.Block) (bool, error) {
-	return v.Engine.(*bor.Bor).IsProposer(headerReader{v}, block)
+	return v.Engine.(*bor.Bor).IsProposer(block.Header())
 }
 
 func (v validator) sealBlocks(blocks []*types.Block) ([]*types.Block, error) {
 	sealedBlocks := make([]*types.Block, 0, len(blocks))
-
-	sealResults := make(chan *types.Block)
 
 	hr := headerReader{v}
 
@@ -199,6 +236,8 @@ func (v validator) sealBlocks(blocks []*types.Block) ([]*types.Block, error) {
 		if parent := hr.GetHeaderByNumber(header.Number.Uint64() - 1); parent != nil {
 			header.ParentHash = parent.Hash()
 		}
+
+		sealResults := make(chan *types.Block, 1)
 
 		if err := v.Engine.Seal(hr, block, sealResults, nil); err != nil {
 			return nil, err
@@ -227,17 +266,22 @@ func (v validator) verifyBlocks(blocks []*types.Block) error {
 func newValidator(t *testing.T, heimdall *test_heimdall, blocks map[uint64]*types.Block) validator {
 	logger := log.Root()
 
+	validatorKey, _ := crypto.GenerateKey()
+	validatorAddress := crypto.PubkeyToAddress(validatorKey.PublicKey)
 	bor := bor.New(
 		heimdall.chainConfig,
 		memdb.New(""),
-		&spanner{span.NewChainSpanner(contract.ValidatorSet(), heimdall.chainConfig, false, logger), span.Span{}},
+		nil, /* blockReader */
+		&spanner{span.NewChainSpanner(contract.ValidatorSet(), heimdall.chainConfig, false, logger), validatorAddress, span.Span{}},
 		heimdall,
 		test_genesisContract{},
 		logger,
 	)
 
-	validatorKey, _ := crypto.GenerateKey()
-	validatorAddress := crypto.PubkeyToAddress(validatorKey.PublicKey)
+	/*fmt.Printf("Private: 0x%s\nPublic: 0x%s\nAddress: %s\n",
+	hex.EncodeToString(crypto.FromECDSA(validatorKey)),
+	hex.EncodeToString(crypto.MarshalPubkey(&validatorKey.PublicKey)),
+	strings.ToLower(validatorAddress.Hex()))*/
 
 	if heimdall.validatorSet == nil {
 		heimdall.validatorSet = valset.NewValidatorSet([]*valset.Validator{

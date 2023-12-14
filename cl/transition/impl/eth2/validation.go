@@ -2,6 +2,7 @@ package eth2
 
 import (
 	"fmt"
+
 	"github.com/Giulio2002/bls"
 	"github.com/ledgerwatch/erigon/cl/abstract"
 	"github.com/ledgerwatch/erigon/cl/cltypes"

@@ -7,10 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/c2h5oh/datasize"
 	"github.com/ledgerwatch/log/v3"
 	"github.com/spf13/cobra"
-	"github.com/torquem-ch/mdbx-go/mdbx"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/ledgerwatch/erigon-lib/kv"
@@ -64,9 +62,10 @@ func dbCfg(label kv.Label, path string) kv2.MdbxOpts {
 	const ThreadsLimit = 9_000
 	limiterB := semaphore.NewWeighted(ThreadsLimit)
 	opts := kv2.NewMDBX(log.New()).Path(path).Label(label).RoTxsLimiter(limiterB)
-	if label == kv.ChainDB {
-		opts = opts.MapSize(8 * datasize.TB)
-	}
+	// integration tool don't intent to create db, then easiest way to open db - it's pass mdbx.Accede flag, which allow
+	// to read all options from DB, instead of overriding them
+	opts = opts.Accede()
+
 	if databaseVerbosity != -1 {
 		opts = opts.DBVerbosity(kv.DBVerbosityLvl(databaseVerbosity))
 	}
@@ -74,10 +73,6 @@ func dbCfg(label kv.Label, path string) kv2.MdbxOpts {
 }
 
 func openDB(opts kv2.MdbxOpts, applyMigrations bool, logger log.Logger) (kv.RwDB, error) {
-	// integration tool don't intent to create db, then easiest way to open db - it's pass mdbx.Accede flag, which allow
-	// to read all options from DB, instead of overriding them
-	opts = opts.Flags(func(f uint) uint { return f | mdbx.Accede })
-
 	db := opts.MustOpen()
 	if applyMigrations {
 		migrator := migrations.NewMigrator(opts.GetLabel())
@@ -110,7 +105,7 @@ func openDB(opts kv2.MdbxOpts, applyMigrations bool, logger log.Logger) (kv.RwDB
 			return nil, err
 		}
 		if h3 {
-			_, agg := allSnapshots(context.Background(), db, logger)
+			_, _, agg := allSnapshots(context.Background(), db, logger)
 			tdb, err := temporal.New(db, agg, systemcontracts.SystemContractCodeLookup[chain])
 			if err != nil {
 				return nil, err
