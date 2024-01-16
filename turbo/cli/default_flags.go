@@ -149,7 +149,6 @@ var DefaultFlags = []cli.Flag{
 	&utils.HeimdallURLFlag,
 	&utils.WebSeedsFlag,
 	&utils.WithoutHeimdallFlag,
-	&utils.HeimdallgRPCAddressFlag,
 	&utils.BorBlockPeriodFlag,
 	&utils.BorBlockSizeFlag,
 	&utils.WithHeimdallMilestones,
@@ -170,6 +169,9 @@ var DefaultFlags = []cli.Flag{
 
 	&utils.BeaconAPIFlag,
 	&utils.BeaconApiAddrFlag,
+	&utils.BeaconApiAllowMethodsFlag,
+	&utils.BeaconApiAllowOriginsFlag,
+	&utils.BeaconApiAllowCredentialsFlag,
 	&utils.BeaconApiPortFlag,
 	&utils.BeaconApiReadTimeoutFlag,
 	&utils.BeaconApiWriteTimeoutFlag,
@@ -183,4 +185,7 @@ var DefaultFlags = []cli.Flag{
 	&utils.RPCSlowFlag,
 
 	&utils.TxPoolGossipDisableFlag,
+	&SyncLoopBlockLimitFlag,
+	&SyncLoopBreakAfterFlag,
+	&SyncLoopPruneLimitFlag,
 }
