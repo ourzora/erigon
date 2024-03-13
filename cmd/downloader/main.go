@@ -20,7 +20,6 @@ import (
 	"github.com/ledgerwatch/erigon-lib/common/dir"
 	"github.com/ledgerwatch/erigon-lib/downloader"
 	"github.com/ledgerwatch/erigon-lib/downloader/downloadercfg"
-	"github.com/ledgerwatch/erigon-lib/downloader/snaptype"
 	proto_downloader "github.com/ledgerwatch/erigon-lib/gointerfaces/downloader"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon-lib/kv/mdbx"
@@ -82,7 +81,8 @@ func init() {
 	utils.CobraFlags(rootCmd, debug.Flags, utils.MetricFlags, logging.Flags)
 
 	withDataDir(rootCmd)
-	rootCmd.Flags().StringVar(&chain, utils.ChainFlag.Name, utils.ChainFlag.Value, utils.ChainFlag.Usage)
+	withChainFlag(rootCmd)
+
 	rootCmd.Flags().StringVar(&webseeds, utils.WebSeedsFlag.Name, utils.WebSeedsFlag.Value, utils.WebSeedsFlag.Usage)
 	rootCmd.Flags().StringVar(&natSetting, "nat", utils.NATFlag.Value, utils.NATFlag.Usage)
 	rootCmd.Flags().StringVar(&downloaderApiAddr, "downloader.api.addr", "127.0.0.1:9093", "external downloader api network address, for example: 127.0.0.1:9093 serves remote downloader interface")
@@ -103,6 +103,7 @@ func init() {
 
 	withDataDir(createTorrent)
 	withFile(createTorrent)
+	withChainFlag(createTorrent)
 	rootCmd.AddCommand(createTorrent)
 
 	rootCmd.AddCommand(torrentCat)
@@ -112,6 +113,7 @@ func init() {
 	rootCmd.AddCommand(manifestCmd)
 
 	withDataDir(printTorrentHashes)
+	withChainFlag(printTorrentHashes)
 	printTorrentHashes.PersistentFlags().BoolVar(&forceRebuild, "rebuild", false, "Force re-create .torrent files")
 	printTorrentHashes.Flags().StringVar(&targetFile, "targetfile", "", "write output to file")
 	if err := printTorrentHashes.MarkFlagFilename("targetfile"); err != nil {
@@ -123,13 +125,22 @@ func init() {
 
 func withDataDir(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&datadirCli, utils.DataDirFlag.Name, paths.DefaultDataDir(), utils.DataDirFlag.Usage)
-	if err := cmd.MarkFlagDirname(utils.DataDirFlag.Name); err != nil {
-		panic(err)
-	}
+	must(cmd.MarkFlagRequired(utils.DataDirFlag.Name))
+	must(cmd.MarkFlagDirname(utils.DataDirFlag.Name))
+}
+func withChainFlag(cmd *cobra.Command) {
+	cmd.Flags().StringVar(&chain, utils.ChainFlag.Name, utils.ChainFlag.Value, utils.ChainFlag.Usage)
+	must(cmd.MarkFlagRequired(utils.ChainFlag.Name))
 }
 func withFile(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&filePath, "file", "", "")
 	if err := cmd.MarkFlagFilename(utils.DataDirFlag.Name); err != nil {
+		panic(err)
+	}
+}
+
+func must(err error) {
+	if err != nil {
 		panic(err)
 	}
 }
@@ -188,7 +199,7 @@ func Downloader(ctx context.Context, logger log.Logger) error {
 	if known, ok := snapcfg.KnownWebseeds[chain]; ok {
 		webseedsList = append(webseedsList, known...)
 	}
-	cfg, err := downloadercfg.New(dirs, version, torrentLogLevel, downloadRate, uploadRate, torrentPort, torrentConnsPerFile, torrentDownloadSlots, staticPeers, webseedsList, chain)
+	cfg, err := downloadercfg.New(dirs, version, torrentLogLevel, downloadRate, uploadRate, torrentPort, torrentConnsPerFile, torrentDownloadSlots, staticPeers, webseedsList, chain, true)
 	if err != nil {
 		return err
 	}
@@ -212,8 +223,13 @@ func Downloader(ctx context.Context, logger log.Logger) error {
 	defer d.Close()
 	logger.Info("[snapshots] Start bittorrent server", "my_peer_id", fmt.Sprintf("%x", d.TorrentClient().PeerID()))
 
-	if err := addPreConfiguredHashes(ctx, d); err != nil {
-		return err
+	if len(_verifyFiles) > 0 {
+		verifyFiles = strings.Split(_verifyFiles, ",")
+	}
+	if verify || verifyFailfast || len(verifyFiles) > 0 { // remove and create .torrent files (will re-read all snapshots)
+		if err = d.VerifyData(ctx, verifyFiles, verifyFailfast); err != nil {
+			return err
+		}
 	}
 
 	d.MainLoopInBackground(false)
@@ -229,15 +245,6 @@ func Downloader(ctx context.Context, logger log.Logger) error {
 	}
 	defer grpcServer.GracefulStop()
 
-	if len(_verifyFiles) > 0 {
-		verifyFiles = strings.Split(_verifyFiles, ",")
-	}
-	if verify || verifyFailfast || len(verifyFiles) > 0 { // remove and create .torrent files (will re-read all snapshots)
-		if err = d.VerifyData(ctx, verifyFiles, verifyFailfast); err != nil {
-			return err
-		}
-	}
-
 	<-ctx.Done()
 	return nil
 }
@@ -246,9 +253,8 @@ var createTorrent = &cobra.Command{
 	Use:     "torrent_create",
 	Example: "go run ./cmd/downloader torrent_create --datadir=<your_datadir> --file=<relative_file_path>",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		//logger := debug.SetupCobra(cmd, "integration")
 		dirs := datadir.New(datadirCli)
-		err := downloader.BuildTorrentFilesIfNeed(cmd.Context(), dirs, downloader.NewAtomicTorrentFiles(dirs.Snap))
+		err := downloader.BuildTorrentFilesIfNeed(cmd.Context(), dirs, downloader.NewAtomicTorrentFiles(dirs.Snap), chain, nil)
 		if err != nil {
 			return err
 		}
@@ -385,7 +391,7 @@ func doPrintTorrentHashes(ctx context.Context, logger log.Logger) error {
 				return err
 			}
 		}
-		if err := downloader.BuildTorrentFilesIfNeed(ctx, dirs, tf); err != nil {
+		if err := downloader.BuildTorrentFilesIfNeed(ctx, dirs, tf, chain, nil); err != nil {
 			return fmt.Errorf("BuildTorrentFilesIfNeed: %w", err)
 		}
 	}
@@ -487,16 +493,6 @@ func StartGrpc(snServer *downloader.GrpcServer, addr string, creds *credentials.
 	}()
 	logger.Info("Started gRPC server", "on", addr)
 	return grpcServer, nil
-}
-
-// Add pre-configured
-func addPreConfiguredHashes(ctx context.Context, d *downloader.Downloader) error {
-	for _, it := range snapcfg.KnownCfg(chain, 0).Preverified {
-		if err := d.AddMagnetLink(ctx, snaptype.Hex2InfoHash(it.Hash), it.Name); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func checkChainName(ctx context.Context, dirs datadir.Dirs, chainName string) error {

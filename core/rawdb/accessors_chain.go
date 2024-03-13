@@ -415,7 +415,7 @@ func CanonicalTransactions(db kv.Getter, baseTxId uint64, amount uint32) ([]type
 	i := uint32(0)
 	if err := db.ForAmount(kv.EthTx, hexutility.EncodeTs(baseTxId), amount, func(k, v []byte) error {
 		var decodeErr error
-		if txs[i], decodeErr = types.UnmarshalTransactionFromBinary(v); decodeErr != nil {
+		if txs[i], decodeErr = types.UnmarshalTransactionFromBinary(v, false /* blobTxnsAreWrappedWithBlobs */); decodeErr != nil {
 			return decodeErr
 		}
 		i++
@@ -1069,7 +1069,7 @@ func PruneBlocks(tx kv.RwTx, blockTo uint64, blocksDeleteLimit int) error {
 // keeps genesis in db: [1, to)
 // doesn't change sequences of kv.EthTx and kv.NonCanonicalTxs
 // doesn't delete Receipts, Senders, Canonical markers, TotalDifficulty
-func PruneBorBlocks(tx kv.RwTx, blockTo uint64, blocksDeleteLimit int, spanIDAt func(number uint64) uint64) error {
+func PruneBorBlocks(tx kv.RwTx, blockTo uint64, blocksDeleteLimit int, SpanIdAt func(number uint64) uint64) error {
 	c, err := tx.Cursor(kv.BorEventNums)
 	if err != nil {
 		return err
@@ -1104,7 +1104,7 @@ func PruneBorBlocks(tx kv.RwTx, blockTo uint64, blocksDeleteLimit int, spanIDAt 
 	if err != nil {
 		return err
 	}
-	firstSpanToKeep := spanIDAt(blockTo)
+	firstSpanToKeep := SpanIdAt(blockTo)
 	c2, err := tx.RwCursor(kv.BorSpans)
 	if err != nil {
 		return err
@@ -1213,6 +1213,17 @@ func ReadHeaderByNumber(db kv.Getter, number uint64) *types.Header {
 	}
 
 	return ReadHeader(db, hash, number)
+}
+
+func ReadFirstNonGenesisHeaderNumber(tx kv.Tx) (uint64, bool, error) {
+	v, err := rawdbv3.SecondKey(tx, kv.Headers)
+	if err != nil {
+		return 0, false, err
+	}
+	if len(v) == 0 {
+		return 0, false, nil
+	}
+	return binary.BigEndian.Uint64(v), true, nil
 }
 
 func ReadHeaderByHash(db kv.Getter, hash common.Hash) (*types.Header, error) {

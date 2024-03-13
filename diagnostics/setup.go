@@ -4,8 +4,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/ledgerwatch/erigon/turbo/node"
 	"github.com/urfave/cli/v2"
+
+	"github.com/ledgerwatch/erigon/turbo/node"
 )
 
 func Setup(ctx *cli.Context, metricsMux *http.ServeMux, node *node.ErigonNode) {
@@ -28,8 +29,9 @@ func Setup(ctx *cli.Context, metricsMux *http.ServeMux, node *node.ErigonNode) {
 	SetupBlockBodyDownload(debugMux)
 	SetupHeaderDownloadStats(debugMux)
 	SetupNodeInfoAccess(debugMux, node)
-	SetupPeersAccess(ctx, debugMux, node)
+	SetupPeersAccess(ctx, debugMux, node, diagnostic)
 	SetupBootnodesAccess(debugMux, node)
 	SetupStagesAccess(debugMux, diagnostic)
+	SetupMemAccess(debugMux)
 
 }

@@ -2,15 +2,19 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"net"
 
+	"github.com/ledgerwatch/erigon/cl/gossip"
+	"github.com/ledgerwatch/erigon/cl/persistence/blob_storage"
+	"github.com/ledgerwatch/erigon/cl/phase1/forkchoice"
 	"github.com/ledgerwatch/erigon/cl/sentinel"
+	"github.com/ledgerwatch/erigon/turbo/snapshotsync/freezeblocks"
 
 	"github.com/ledgerwatch/erigon-lib/direct"
 	sentinelrpc "github.com/ledgerwatch/erigon-lib/gointerfaces/sentinel"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon/cl/cltypes"
-	"github.com/ledgerwatch/erigon/cl/persistence"
 	"github.com/ledgerwatch/log/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -21,8 +25,19 @@ type ServerConfig struct {
 	Addr    string
 }
 
-func createSentinel(cfg *sentinel.SentinelConfig, db persistence.RawBeaconBlockChain, indiciesDB kv.RwDB, logger log.Logger) (*sentinel.Sentinel, error) {
-	sent, err := sentinel.New(context.Background(), cfg, db, indiciesDB, logger)
+func generateSubnetsTopics(template string, maxIds int) []sentinel.GossipTopic {
+	topics := make([]sentinel.GossipTopic, 0, maxIds)
+	for i := 0; i < maxIds; i++ {
+		topics = append(topics, sentinel.GossipTopic{
+			Name:     fmt.Sprintf(template, i),
+			CodecStr: sentinel.SSZSnappyCodec,
+		})
+	}
+	return topics
+}
+
+func createSentinel(cfg *sentinel.SentinelConfig, blockReader freezeblocks.BeaconSnapshotReader, blobStorage blob_storage.BlobStorage, indiciesDB kv.RwDB, forkChoiceReader forkchoice.ForkChoiceStorageReader, logger log.Logger) (*sentinel.Sentinel, error) {
+	sent, err := sentinel.New(context.Background(), cfg, blockReader, blobStorage, indiciesDB, logger, forkChoiceReader)
 	if err != nil {
 		return nil, err
 	}
@@ -36,7 +51,11 @@ func createSentinel(cfg *sentinel.SentinelConfig, db persistence.RawBeaconBlockC
 		sentinel.ProposerSlashingSsz,
 		sentinel.AttesterSlashingSsz,
 		sentinel.BlsToExecutionChangeSsz,
+		sentinel.SyncCommitteeContributionAndProofSsz,
+		////sentinel.LightClientFinalityUpdateSsz,
+		////sentinel.LightClientOptimisticUpdateSsz,
 	}
+	gossipTopics = append(gossipTopics, generateSubnetsTopics(gossip.TopicNamePrefixBlobSidecar, int(cfg.BeaconConfig.MaxBlobsPerBlock))...)
 	// gossipTopics = append(gossipTopics, sentinel.GossipSidecarTopics(chain.MaxBlobsPerBlock)...)
 
 	for _, v := range gossipTopics {
@@ -58,9 +77,9 @@ func createSentinel(cfg *sentinel.SentinelConfig, db persistence.RawBeaconBlockC
 	return sent, nil
 }
 
-func StartSentinelService(cfg *sentinel.SentinelConfig, db persistence.RawBeaconBlockChain, indiciesDB kv.RwDB, srvCfg *ServerConfig, creds credentials.TransportCredentials, initialStatus *cltypes.Status, logger log.Logger) (sentinelrpc.SentinelClient, error) {
+func StartSentinelService(cfg *sentinel.SentinelConfig, blockReader freezeblocks.BeaconSnapshotReader, blobStorage blob_storage.BlobStorage, indiciesDB kv.RwDB, srvCfg *ServerConfig, creds credentials.TransportCredentials, initialStatus *cltypes.Status, forkChoiceReader forkchoice.ForkChoiceStorageReader, logger log.Logger) (sentinelrpc.SentinelClient, error) {
 	ctx := context.Background()
-	sent, err := createSentinel(cfg, db, indiciesDB, logger)
+	sent, err := createSentinel(cfg, blockReader, blobStorage, indiciesDB, forkChoiceReader, logger)
 	if err != nil {
 		return nil, err
 	}

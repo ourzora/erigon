@@ -21,6 +21,7 @@ type PeerStatisticsGetter interface {
 }
 
 type PeerStatistics struct {
+	PeerType     string
 	BytesIn      uint64
 	BytesOut     uint64
 	CapBytesIn   map[string]uint64
@@ -29,10 +30,30 @@ type PeerStatistics struct {
 	TypeBytesOut map[string]uint64
 }
 
+type PeerDataUpdate struct {
+	PeerID string
+	ENR    string
+	Enode  string
+	ID     string
+	Name   string
+	Type   string
+	Caps   []string
+}
+
+type PeerStatisticMsgUpdate struct {
+	PeerType string
+	PeerID   string
+	Inbound  bool
+	MsgType  string
+	MsgCap   string
+	Bytes    int
+}
+
 type SyncStatistics struct {
 	SyncStages       SyncStages                 `json:"syncStages"`
 	SnapshotDownload SnapshotDownloadStatistics `json:"snapshotDownload"`
 	SnapshotIndexing SnapshotIndexingStatistics `json:"snapshotIndexing"`
+	BlockExecution   BlockExecutionStatistics   `json:"blockExecution"`
 }
 
 type SnapshotDownloadStatistics struct {
@@ -52,13 +73,16 @@ type SnapshotDownloadStatistics struct {
 }
 
 type SegmentDownloadStatistics struct {
-	Name            string `json:"name"`
-	TotalBytes      uint64 `json:"totalBytes"`
-	DownloadedBytes uint64 `json:"downloadedBytes"`
-	WebseedsCount   int    `json:"webseedsCount"`
-	PeersCount      int    `json:"peersCount"`
-	WebseedsRate    uint64 `json:"webseedsRate"`
-	PeersRate       uint64 `json:"peersRate"`
+	Name            string        `json:"name"`
+	TotalBytes      uint64        `json:"totalBytes"`
+	DownloadedBytes uint64        `json:"downloadedBytes"`
+	Webseeds        []SegmentPeer `json:"webseeds"`
+	Peers           []SegmentPeer `json:"peers"`
+}
+
+type SegmentPeer struct {
+	Url          string `json:"url"`
+	DownloadRate uint64 `json:"downloadRate"`
 }
 
 type SnapshotIndexingStatistics struct {
@@ -90,6 +114,55 @@ type SyncStages struct {
 	CurrentStage uint     `json:"currentStage"`
 }
 
+type BlockExecutionStatistics struct {
+	From        uint64  `json:"from"`
+	To          uint64  `json:"to"`
+	BlockNumber uint64  `json:"blockNumber"`
+	BlkPerSec   float64 `json:"blkPerSec"`
+	TxPerSec    float64 `json:"txPerSec"`
+	MgasPerSec  float64 `json:"mgasPerSec"`
+	GasState    float64 `json:"gasState"`
+	Batch       uint64  `json:"batch"`
+	Alloc       uint64  `json:"alloc"`
+	Sys         uint64  `json:"sys"`
+	TimeElapsed float64 `json:"timeElapsed"`
+}
+
+type SnapshoFilesList struct {
+	Files []string `json:"files"`
+}
+
+type HardwareInfo struct {
+	Disk DiskInfo `json:"disk"`
+	RAM  RAMInfo  `json:"ram"`
+	CPU  CPUInfo  `json:"cpu"`
+}
+
+type RAMInfo struct {
+	Total uint64 `json:"total"`
+	Free  uint64 `json:"free"`
+}
+
+type DiskInfo struct {
+	FsType string `json:"fsType"`
+	Total  uint64 `json:"total"`
+	Free   uint64 `json:"free"`
+}
+
+type CPUInfo struct {
+	Cores     int     `json:"cores"`
+	ModelName string  `json:"modelName"`
+	Mhz       float64 `json:"mhz"`
+}
+
+func (ti SnapshoFilesList) Type() Type {
+	return TypeOf(ti)
+}
+
+func (ti BlockExecutionStatistics) Type() Type {
+	return TypeOf(ti)
+}
+
 func (ti SnapshotDownloadStatistics) Type() Type {
 	return TypeOf(ti)
 }
@@ -111,5 +184,9 @@ func (ti SyncStagesList) Type() Type {
 }
 
 func (ti CurrentSyncStage) Type() Type {
+	return TypeOf(ti)
+}
+
+func (ti PeerStatisticMsgUpdate) Type() Type {
 	return TypeOf(ti)
 }
