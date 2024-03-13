@@ -13,6 +13,8 @@ import (
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
 )
 
+const maxAttestationJobLifetime = 30 * time.Minute
+
 // OnAttestation processes incoming attestations.
 func (f *ForkChoiceStore) OnAttestation(attestation *solid.Attestation, fromBlock bool, insert bool) error {
 	if !f.synced.Load() {
@@ -81,11 +83,19 @@ func (f *ForkChoiceStore) OnAggregateAndProof(aggregateAndProof *cltypes.SignedA
 	committeeIndex := aggregateAndProof.Message.Aggregate.AttestantionData().ValidatorIndex()
 	epoch := state.GetEpochAtSlot(f.beaconCfg, slot)
 
+	if err := f.validateOnAttestation(aggregateAndProof.Message.Aggregate, false); err != nil {
+		return err
+	}
+
 	target := aggregateAndProof.Message.Aggregate.AttestantionData().Target()
+	// getCheckpointState is non-thread safe, so we need to lock
+	f.mu.Lock()
 	targetState, err := f.getCheckpointState(target)
 	if err != nil {
+		f.mu.Unlock()
 		return nil
 	}
+	f.mu.Unlock()
 
 	activeIndicies := targetState.getActiveIndicies(epoch)
 	activeIndiciesLength := uint64(len(activeIndicies))
@@ -101,22 +111,48 @@ func (f *ForkChoiceStore) OnAggregateAndProof(aggregateAndProof *cltypes.SignedA
 	return f.OnAttestation(aggregateAndProof.Message.Aggregate, false, false)
 }
 
+type attestationJob struct {
+	attestation *solid.Attestation
+	insert      bool
+	when        time.Time
+}
+
 // scheduleAttestationForLaterProcessing scheudules an attestation for later processing
 func (f *ForkChoiceStore) scheduleAttestationForLaterProcessing(attestation *solid.Attestation, insert bool) {
+	root, err := attestation.HashSSZ()
+	if err != nil {
+		log.Error("failed to hash attestation", "err", err)
+		return
+	}
+	f.attestationSet.Store(root, &attestationJob{
+		attestation: attestation,
+		insert:      insert,
+		when:        time.Now(),
+	})
+}
+
+func (f *ForkChoiceStore) StartAttestationsRTT() {
 	go func() {
-		logInterval := time.NewTicker(50 * time.Millisecond)
+		interval := time.NewTicker(500 * time.Millisecond)
 		for {
 			select {
 			case <-f.ctx.Done():
 				return
-			case <-logInterval.C:
-				if f.Slot() < attestation.AttestantionData().Slot()+1 {
-					continue
-				}
-				if err := f.OnAttestation(attestation, false, insert); err != nil {
-					log.Debug("could not process scheduled attestation", "reason", err)
-				}
-				return
+			case <-interval.C:
+				f.attestationSet.Range(func(key, value interface{}) bool {
+					job := value.(*attestationJob)
+					if time.Since(job.when) > maxAttestationJobLifetime {
+						f.attestationSet.Delete(key)
+						return true
+					}
+					if f.Slot() >= job.attestation.AttestantionData().Slot()+1 {
+						if err := f.OnAttestation(job.attestation, false, job.insert); err != nil {
+							log.Warn("failed to process attestation", "err", err)
+						}
+						f.attestationSet.Delete(key)
+					}
+					return true
+				})
 			}
 		}
 	}()
