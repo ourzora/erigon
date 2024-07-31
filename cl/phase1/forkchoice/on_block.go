@@ -1,46 +1,48 @@
+// Copyright 2024 The Erigon Authors
+// This file is part of Erigon.
+//
+// Erigon is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Erigon is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with Erigon. If not, see <http://www.gnu.org/licenses/>.
+
 package forkchoice
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
 
-	gokzg4844 "github.com/crate-crypto/go-kzg-4844"
-	"github.com/ledgerwatch/log/v3"
+	"github.com/erigontech/erigon-lib/log/v3"
 
-	"github.com/ledgerwatch/erigon-lib/common"
-	libcommon "github.com/ledgerwatch/erigon-lib/common"
-	"github.com/ledgerwatch/erigon-lib/common/length"
-	"github.com/ledgerwatch/erigon-lib/crypto/kzg"
+	"github.com/erigontech/erigon-lib/common"
+	libcommon "github.com/erigontech/erigon-lib/common"
 
-	"github.com/ledgerwatch/erigon/cl/clparams"
-	"github.com/ledgerwatch/erigon/cl/cltypes"
-	"github.com/ledgerwatch/erigon/cl/cltypes/solid"
-	"github.com/ledgerwatch/erigon/cl/phase1/core/state"
-	"github.com/ledgerwatch/erigon/cl/phase1/forkchoice/fork_graph"
-	"github.com/ledgerwatch/erigon/cl/transition/impl/eth2/statechange"
-	"github.com/ledgerwatch/erigon/cl/utils"
-	"github.com/ledgerwatch/erigon/core/types"
-	"github.com/ledgerwatch/erigon/eth/ethutils"
+	"github.com/erigontech/erigon/cl/clparams"
+	"github.com/erigontech/erigon/cl/cltypes"
+	"github.com/erigontech/erigon/cl/cltypes/solid"
+	"github.com/erigontech/erigon/cl/phase1/core/state"
+	"github.com/erigontech/erigon/cl/phase1/execution_client"
+	"github.com/erigontech/erigon/cl/phase1/forkchoice/fork_graph"
+	"github.com/erigontech/erigon/cl/transition/impl/eth2/statechange"
+	"github.com/erigontech/erigon/cl/utils"
+	"github.com/erigontech/erigon/core/types"
+	"github.com/erigontech/erigon/eth/ethutils"
 )
 
 const foreseenProposers = 16
 
-var errEIP4844DataNotAvailable = fmt.Errorf("EIP-4844 blob data is not available")
-
-func (f *ForkChoiceStore) deriveNonAnchorPublicKeys(s *state.CachingBeaconState) ([]byte, error) {
-	l := len(f.anchorPublicKeys) / length.Bytes48
-	buf := make([]byte, (s.ValidatorLength()-l)*length.Bytes48)
-	for i := l; i < s.ValidatorLength(); i++ {
-		pk, err := s.ValidatorPublicKey(i)
-		if err != nil {
-			return nil, err
-		}
-		copy(buf[(i-l)*length.Bytes48:], pk[:])
-	}
-	return buf, nil
-}
+var ErrEIP4844DataNotAvailable = errors.New("EIP-4844 blob data is not available")
 
 func verifyKzgCommitmentsAgainstTransactions(cfg *clparams.BeaconChainConfig, block *cltypes.Eth1Block, kzgCommitments *solid.ListSSZ[*cltypes.KZGCommitment]) error {
 	expectedBlobHashes := []common.Hash{}
@@ -74,7 +76,7 @@ func (f *ForkChoiceStore) OnBlock(ctx context.Context, block *cltypes.SignedBeac
 		return err
 	}
 	if f.Slot() < block.Block.Slot {
-		return fmt.Errorf("block is too early compared to current_slot")
+		return errors.New("block is too early compared to current_slot")
 	}
 	// Check that block is later than the finalized epoch slot (optimization to reduce calls to get_ancestor)
 	finalizedSlot := f.computeStartSlotAtEpoch(f.finalizedCheckpoint.Load().(solid.Checkpoint).Epoch())
@@ -98,36 +100,49 @@ func (f *ForkChoiceStore) OnBlock(ctx context.Context, block *cltypes.SignedBeac
 	// Check if blob data is available
 	if block.Version() >= clparams.DenebVersion && checkDataAvaiability {
 		if err := f.isDataAvailable(ctx, block.Block.Slot, blockRoot, block.Block.Body.BlobKzgCommitments); err != nil {
-			if err == errEIP4844DataNotAvailable {
-				log.Debug("Blob data is not available, the block will be scheduled for later processing", "slot", block.Block.Slot, "blockRoot", libcommon.Hash(blockRoot))
-				f.scheduleBlockForLaterProcessing(block)
+			if err == ErrEIP4844DataNotAvailable {
 				return err
 			}
-			return fmt.Errorf("OnBlock: data is not available for block %x: %v", blockRoot, err)
+			return fmt.Errorf("OnBlock: data is not available for block %x: %v", libcommon.Hash(blockRoot), err)
 		}
 	}
 
-	var invalidBlock bool
+	startEngine := time.Now()
 	if newPayload && f.engine != nil {
 		if block.Version() >= clparams.DenebVersion {
 			if err := verifyKzgCommitmentsAgainstTransactions(f.beaconCfg, block.Block.Body.ExecutionPayload, block.Block.Body.BlobKzgCommitments); err != nil {
 				return fmt.Errorf("OnBlock: failed to process kzg commitments: %v", err)
 			}
 		}
-
-		if invalidBlock, err = f.engine.NewPayload(ctx, block.Block.Body.ExecutionPayload, &block.Block.ParentRoot, versionedHashes); err != nil {
-			if invalidBlock {
-				f.forkGraph.MarkHeaderAsInvalid(blockRoot)
+		payloadStatus, err := f.engine.NewPayload(ctx, block.Block.Body.ExecutionPayload, &block.Block.ParentRoot, versionedHashes)
+		switch payloadStatus {
+		case execution_client.PayloadStatusNotValidated:
+			log.Debug("OnBlock: block is not validated yet", "block", libcommon.Hash(blockRoot))
+			// optimistic block candidate
+			if err := f.optimisticStore.AddOptimisticCandidate(block.Block); err != nil {
+				return fmt.Errorf("failed to add block to optimistic store: %v", err)
 			}
-			log.Warn("newPayload failed", "err", err)
-			return err
-		}
-		if invalidBlock {
+		case execution_client.PayloadStatusInvalidated:
+			log.Warn("OnBlock: block is invalid", "block", libcommon.Hash(blockRoot), "err", err)
+			log.Debug("OnBlock: block is invalid", "block", libcommon.Hash(blockRoot))
 			f.forkGraph.MarkHeaderAsInvalid(blockRoot)
-			return fmt.Errorf("execution client failed")
+			// remove from optimistic candidate
+			if err := f.optimisticStore.InvalidateBlock(block.Block); err != nil {
+				return fmt.Errorf("failed to remove block from optimistic store: %v", err)
+			}
+			return errors.New("block is invalid")
+		case execution_client.PayloadStatusValidated:
+			log.Trace("OnBlock: block is validated", "block", libcommon.Hash(blockRoot))
+			// remove from optimistic candidate
+			if err := f.optimisticStore.ValidateBlock(block.Block); err != nil {
+				return fmt.Errorf("failed to validate block in optimistic store: %v", err)
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("newPayload failed: %v", err)
 		}
 	}
-
+	log.Trace("OnBlock: engine", "elapsed", time.Since(startEngine))
 	lastProcessedState, status, err := f.forkGraph.AddChainSegment(block, fullValidation)
 	if err != nil {
 		return err
@@ -138,10 +153,10 @@ func (f *ForkChoiceStore) OnBlock(ctx context.Context, block *cltypes.SignedBeac
 	case fork_graph.Success:
 		f.updateChildren(block.Block.Slot-1, block.Block.ParentRoot, blockRoot) // parent slot can be innacurate
 	case fork_graph.BelowAnchor:
-		log.Debug("replay block", "code", status)
+		log.Debug("replay block", "status", status.String())
 		return nil
 	default:
-		return fmt.Errorf("replay block, code: %+v", status)
+		return fmt.Errorf("replay block, status %+v", status)
 	}
 	if block.Block.Body.ExecutionPayload != nil {
 		f.eth2Roots.Add(blockRoot, block.Block.Body.ExecutionPayload.BlockHash)
@@ -181,11 +196,7 @@ func (f *ForkChoiceStore) OnBlock(ctx context.Context, block *cltypes.SignedBeac
 		currentJustifiedCheckpoint:  lastProcessedState.CurrentJustifiedCheckpoint().Copy(),
 		previousJustifiedCheckpoint: lastProcessedState.PreviousJustifiedCheckpoint().Copy(),
 	})
-	pks, err := f.deriveNonAnchorPublicKeys(lastProcessedState)
-	if err != nil {
-		return err
-	}
-	f.publicKeysPerState.Store(libcommon.Hash(blockRoot), pks)
+
 	f.totalActiveBalances.Add(blockRoot, lastProcessedState.GetTotalActiveBalance())
 	// Update checkpoints
 	f.updateCheckpoints(lastProcessedState.CurrentJustifiedCheckpoint().Copy(), lastProcessedState.FinalizedCheckpoint().Copy())
@@ -247,13 +258,13 @@ func (f *ForkChoiceStore) isDataAvailable(ctx context.Context, slot uint64, bloc
 	}
 
 	if blobKzgCommitments.Len() != len(sidecars) {
-		return errEIP4844DataNotAvailable // This should then schedule the block for reprocessing
+		return ErrEIP4844DataNotAvailable // This should then schedule the block for reprocessing
 	}
 	for _, sidecar := range sidecars {
 		delete(commitmentsLeftToCheck, sidecar.KzgCommitment)
 	}
 	if len(commitmentsLeftToCheck) > 0 {
-		return errEIP4844DataNotAvailable // This should then schedule the block for reprocessing
+		return ErrEIP4844DataNotAvailable // This should then schedule the block for reprocessing
 	}
 	if !foundOnDisk {
 		// If we didn't find the sidecars on disk, we should write them to disk now
@@ -264,74 +275,5 @@ func (f *ForkChoiceStore) isDataAvailable(ctx context.Context, slot uint64, bloc
 			return fmt.Errorf("failed to write blob sidecars: %v", err)
 		}
 	}
-	return nil
-}
-
-func (f *ForkChoiceStore) OnBlobSidecar(blobSidecar *cltypes.BlobSidecar, test bool) error {
-	kzgCtx := kzg.Ctx()
-
-	parentHeader, has := f.GetHeader(blobSidecar.SignedBlockHeader.Header.ParentRoot)
-	if !has {
-		return fmt.Errorf("parent header not found")
-	}
-	if blobSidecar.SignedBlockHeader.Header.Slot <= parentHeader.Slot {
-		return fmt.Errorf("blob sidecar has invalid slot")
-	}
-	expectedProposers, has := f.nextBlockProposers.Get(blobSidecar.SignedBlockHeader.Header.ParentRoot)
-	proposerSubIdx := blobSidecar.SignedBlockHeader.Header.Slot - parentHeader.Slot
-	if !test && has && proposerSubIdx < foreseenProposers && len(expectedProposers) > int(proposerSubIdx) {
-		// Do extra checks on the proposer.
-		expectedProposer := expectedProposers[proposerSubIdx]
-		if blobSidecar.SignedBlockHeader.Header.ProposerIndex != expectedProposer {
-			return fmt.Errorf("incorrect proposer index")
-		}
-		// verify the signature finally
-		verifyFn := VerifyHeaderSignatureAgainstForkChoiceStoreFunction(f, f.beaconCfg, f.genesisValidatorsRoot)
-		if err := verifyFn(blobSidecar.SignedBlockHeader); err != nil {
-			return err
-		}
-	}
-
-	if !test && !cltypes.VerifyCommitmentInclusionProof(blobSidecar.KzgCommitment, blobSidecar.CommitmentInclusionProof, blobSidecar.Index,
-		clparams.DenebVersion, blobSidecar.SignedBlockHeader.Header.BodyRoot) {
-		return fmt.Errorf("commitment inclusion proof failed")
-	}
-
-	if err := kzgCtx.VerifyBlobKZGProof(gokzg4844.Blob(blobSidecar.Blob), gokzg4844.KZGCommitment(blobSidecar.KzgCommitment), gokzg4844.KZGProof(blobSidecar.KzgProof)); err != nil {
-		return fmt.Errorf("blob KZG proof verification failed: %v", err)
-	}
-
-	blockRoot, err := blobSidecar.SignedBlockHeader.Header.HashSSZ()
-	if err != nil {
-		return err
-	}
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	// operation is not thread safe here.
-	f.hotSidecars[blockRoot] = append(f.hotSidecars[blockRoot], blobSidecar)
-	for _, sidecar := range f.hotSidecars[blockRoot] {
-		if sidecar.SignedBlockHeader.Header.Slot == blobSidecar.SignedBlockHeader.Header.Slot &&
-			sidecar.SignedBlockHeader.Header.ProposerIndex == blobSidecar.SignedBlockHeader.Header.ProposerIndex &&
-			sidecar.Index == blobSidecar.Index {
-			return nil // ignore if we already have it
-		}
-	}
-
-	blobsMaxAge := 4 // a slot can live for up to 4 slots in the pool of hot sidecars.
-	currentSlot := utils.GetCurrentSlot(f.genesisTime, f.beaconCfg.SecondsPerSlot)
-	var pruneSlot uint64
-	if currentSlot > uint64(blobsMaxAge) {
-		pruneSlot = currentSlot - uint64(blobsMaxAge)
-	}
-	// also clean up all old blobs that may have been accumulating
-	for blockRoot := range f.hotSidecars {
-		h, has := f.GetHeader(blockRoot)
-		if !has || h == nil || h.Slot < pruneSlot {
-			delete(f.hotSidecars, blockRoot)
-		}
-	}
-
 	return nil
 }

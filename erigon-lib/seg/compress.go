@@ -1,24 +1,25 @@
-/*
-   Copyright 2021 Erigon contributors
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-*/
+// Copyright 2021 The Erigon Authors
+// This file is part of Erigon.
+//
+// Erigon is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Erigon is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with Erigon. If not, see <http://www.gnu.org/licenses/>.
 
 package seg
 
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"container/heap"
 	"context"
 	"encoding/binary"
@@ -28,17 +29,16 @@ import (
 	"math/bits"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/c2h5oh/datasize"
-	"github.com/ledgerwatch/log/v3"
-	"golang.org/x/exp/slices"
 
-	"github.com/ledgerwatch/erigon-lib/common"
-	"github.com/ledgerwatch/erigon-lib/common/cmp"
-	dir2 "github.com/ledgerwatch/erigon-lib/common/dir"
-	"github.com/ledgerwatch/erigon-lib/etl"
+	"github.com/erigontech/erigon-lib/common"
+	dir2 "github.com/erigontech/erigon-lib/common/dir"
+	"github.com/erigontech/erigon-lib/etl"
+	"github.com/erigontech/erigon-lib/log/v3"
 )
 
 // Compressor is the main operating type for performing per-word compression
@@ -95,7 +95,7 @@ func NewCompressor(ctx context.Context, logPrefix, outputFile, tmpDir string, mi
 	wg.Add(workers)
 	suffixCollectors := make([]*etl.Collector, workers)
 	for i := 0; i < workers; i++ {
-		collector := etl.NewCollector(logPrefix+"_dict", tmpDir, etl.NewSortableBuffer(etl.BufferOptimalSize/2), logger)
+		collector := etl.NewCollector(logPrefix+"_dict", tmpDir, etl.NewSortableBuffer(etl.BufferOptimalSize/2), logger) //nolint:gocritic
 		collector.LogLvl(lvl)
 
 		suffixCollectors[i] = collector

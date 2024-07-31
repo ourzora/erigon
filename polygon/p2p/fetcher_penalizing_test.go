@@ -1,3 +1,19 @@
+// Copyright 2024 The Erigon Authors
+// This file is part of Erigon.
+//
+// Erigon is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Erigon is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with Erigon. If not, see <http://www.gnu.org/licenses/>.
+
 package p2p
 
 import (
@@ -7,9 +23,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/ledgerwatch/erigon-lib/common"
-	"github.com/ledgerwatch/erigon-lib/gointerfaces/sentry"
-	"github.com/ledgerwatch/erigon/core/types"
+	"github.com/erigontech/erigon-lib/common"
+	sentry "github.com/erigontech/erigon-lib/gointerfaces/sentryproto"
+	"github.com/erigontech/erigon/core/types"
 )
 
 func TestPenalizingFetcherFetchHeadersShouldPenalizePeerWhenErrTooManyHeaders(t *testing.T) {
@@ -43,7 +59,7 @@ func TestPenalizingFetcherFetchHeadersShouldPenalizePeerWhenErrTooManyHeaders(t 
 		require.ErrorAs(t, err, &errTooManyHeaders)
 		require.Equal(t, 2, errTooManyHeaders.requested)
 		require.Equal(t, 5, errTooManyHeaders.received)
-		require.Nil(t, headers)
+		require.Nil(t, headers.Data)
 	})
 }
 
@@ -82,7 +98,7 @@ func TestPenalizingFetcherFetchHeadersShouldPenalizePeerWhenErrNonSequentialHead
 		require.ErrorAs(t, err, &errNonSequentialHeaderNumbers)
 		require.Equal(t, uint64(3), errNonSequentialHeaderNumbers.current)
 		require.Equal(t, uint64(2), errNonSequentialHeaderNumbers.expected)
-		require.Nil(t, headers)
+		require.Nil(t, headers.Data)
 	})
 }
 
@@ -119,11 +135,11 @@ func TestPenalizingFetcherFetchHeadersShouldPenalizePeerWhenIncorrectOrigin(t *t
 		require.ErrorAs(t, err, &errNonSequentialHeaderNumbers)
 		require.Equal(t, uint64(2), errNonSequentialHeaderNumbers.current)
 		require.Equal(t, uint64(1), errNonSequentialHeaderNumbers.expected)
-		require.Nil(t, headers)
+		require.Nil(t, headers.Data)
 	})
 }
 
-func TestPenalizingFetcherFetchBodiesShouldPenalizePeerWhenErrEmptyBody(t *testing.T) {
+func TestPenalizingFetcherFetchBodiesShouldPenalizePeerWhenErrTooManyBodies(t *testing.T) {
 	t.Parallel()
 
 	peerId := PeerIdFromUint64(1)
@@ -134,7 +150,7 @@ func TestPenalizingFetcherFetchBodiesShouldPenalizePeerWhenErrEmptyBody(t *testi
 		{
 			Id:     sentry.MessageId_BLOCK_BODIES_66,
 			PeerId: peerId.H512(),
-			Data:   newMockBlockBodiesPacketBytes(t, requestId, &types.Body{}),
+			Data:   newMockBlockBodiesPacketBytes(t, requestId, &types.Body{}, &types.Body{}),
 		},
 	}
 	mockRequestResponse := requestResponseMock{
@@ -149,9 +165,12 @@ func TestPenalizingFetcherFetchBodiesShouldPenalizePeerWhenErrEmptyBody(t *testi
 	// setup expectation that peer should be penalized
 	mockExpectPenalizePeer(t, test.sentryClient, peerId)
 	test.run(func(ctx context.Context, t *testing.T) {
+		var errTooManyBodies *ErrTooManyBodies
 		bodies, err := test.penalizingFetcher.FetchBodies(ctx, headers, peerId)
-		require.ErrorIs(t, err, ErrEmptyBody)
-		require.Nil(t, bodies)
+		require.ErrorAs(t, err, &errTooManyBodies)
+		require.Equal(t, 1, errTooManyBodies.requested)
+		require.Equal(t, 2, errTooManyBodies.received)
+		require.Nil(t, bodies.Data)
 	})
 }
 

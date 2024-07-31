@@ -1,57 +1,78 @@
+// Copyright 2024 The Erigon Authors
+// This file is part of Erigon.
+//
+// Erigon is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Erigon is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with Erigon. If not, see <http://www.gnu.org/licenses/>.
+
 package sync
 
 import (
 	"context"
 	"errors"
 
-	"github.com/ledgerwatch/log/v3"
+	"github.com/erigontech/erigon-lib/log/v3"
 
-	"github.com/ledgerwatch/erigon/core/types"
-	"github.com/ledgerwatch/erigon/polygon/heimdall"
-	"github.com/ledgerwatch/erigon/polygon/p2p"
+	"github.com/erigontech/erigon/core/types"
+	"github.com/erigontech/erigon/polygon/heimdall"
+	"github.com/erigontech/erigon/polygon/p2p"
 )
 
+type latestSpanFetcher func(ctx context.Context, count uint) ([]*heimdall.Span, error)
+
 type Sync struct {
-	storage          Storage
-	execution        ExecutionClient
-	verify           AccumulatedHeadersVerifier
-	p2pService       p2p.Service
-	downloader       HeaderDownloader
-	ccBuilderFactory func(root *types.Header, span *heimdall.Span) CanonicalChainBuilder
-	spansCache       *SpansCache
-	fetchLatestSpan  func(ctx context.Context) (*heimdall.Span, error)
-	events           <-chan Event
-	logger           log.Logger
+	store             Store
+	execution         ExecutionClient
+	milestoneVerifier WaypointHeadersVerifier
+	blocksVerifier    BlocksVerifier
+	p2pService        p2p.Service
+	blockDownloader   BlockDownloader
+	ccBuilderFactory  CanonicalChainBuilderFactory
+	spansCache        *SpansCache
+	fetchLatestSpans  latestSpanFetcher
+	events            <-chan Event
+	logger            log.Logger
 }
 
 func NewSync(
-	storage Storage,
+	store Store,
 	execution ExecutionClient,
-	verify AccumulatedHeadersVerifier,
+	milestoneVerifier WaypointHeadersVerifier,
+	blocksVerifier BlocksVerifier,
 	p2pService p2p.Service,
-	downloader HeaderDownloader,
-	ccBuilderFactory func(root *types.Header, span *heimdall.Span) CanonicalChainBuilder,
+	blockDownloader BlockDownloader,
+	ccBuilderFactory CanonicalChainBuilderFactory,
 	spansCache *SpansCache,
-	fetchLatestSpan func(ctx context.Context) (*heimdall.Span, error),
+	fetchLatestSpans latestSpanFetcher,
 	events <-chan Event,
 	logger log.Logger,
 ) *Sync {
 	return &Sync{
-		storage:          storage,
-		execution:        execution,
-		verify:           verify,
-		p2pService:       p2pService,
-		downloader:       downloader,
-		ccBuilderFactory: ccBuilderFactory,
-		spansCache:       spansCache,
-		fetchLatestSpan:  fetchLatestSpan,
-		events:           events,
-		logger:           logger,
+		store:             store,
+		execution:         execution,
+		milestoneVerifier: milestoneVerifier,
+		blocksVerifier:    blocksVerifier,
+		p2pService:        p2pService,
+		blockDownloader:   blockDownloader,
+		ccBuilderFactory:  ccBuilderFactory,
+		spansCache:        spansCache,
+		fetchLatestSpans:  fetchLatestSpans,
+		events:            events,
+		logger:            logger,
 	}
 }
 
 func (s *Sync) commitExecution(ctx context.Context, newTip *types.Header, finalizedHeader *types.Header) error {
-	if err := s.storage.Flush(ctx); err != nil {
+	if err := s.store.Flush(ctx, newTip); err != nil {
 		return err
 	}
 	return s.execution.UpdateForkChoice(ctx, newTip, finalizedHeader)
@@ -68,7 +89,7 @@ func (s *Sync) onMilestoneEvent(
 	}
 
 	milestoneHeaders := ccBuilder.HeadersInRange(milestone.StartBlock().Uint64(), milestone.Length())
-	err := s.verify(milestone, milestoneHeaders)
+	err := s.milestoneVerifier(milestone, milestoneHeaders)
 	if err == nil {
 		if err = ccBuilder.Prune(milestone.EndBlock().Uint64()); err != nil {
 			return err
@@ -76,7 +97,7 @@ func (s *Sync) onMilestoneEvent(
 	}
 
 	s.logger.Debug(
-		"sync.Sync.onMilestoneEvent: local chain tip does not match the milestone, unwinding to the previous verified milestone",
+		syncLogPrefix("onMilestoneEvent: local chain tip does not match the milestone, unwinding to the previous verified milestone"),
 		"err", err,
 	)
 
@@ -88,7 +109,7 @@ func (s *Sync) onMilestoneEvent(
 		return err
 	}
 
-	newTip, err := s.downloader.DownloadUsingMilestones(ctx, oldTipNum)
+	newTip, err := s.blockDownloader.DownloadBlocksUsingMilestones(ctx, oldTipNum)
 	if err != nil {
 		return err
 	}
@@ -105,40 +126,66 @@ func (s *Sync) onMilestoneEvent(
 	return nil
 }
 
-func (s *Sync) onNewHeaderEvent(
+func (s *Sync) onNewBlockEvent(
 	ctx context.Context,
-	event EventNewHeader,
+	event EventNewBlock,
 	ccBuilder CanonicalChainBuilder,
 ) error {
-	if event.NewHeader.Number.Uint64() <= ccBuilder.Root().Number.Uint64() {
+	newBlockHeader := event.NewBlock.Header()
+	newBlockHeaderNum := newBlockHeader.Number.Uint64()
+	rootNum := ccBuilder.Root().Number.Uint64()
+	if newBlockHeaderNum <= rootNum {
 		return nil
 	}
 
-	var newHeaders []*types.Header
+	var newBlocks []*types.Block
 	var err error
-	if ccBuilder.ContainsHash(event.NewHeader.ParentHash) {
-		newHeaders = []*types.Header{event.NewHeader}
+	if ccBuilder.ContainsHash(newBlockHeader.ParentHash) {
+		newBlocks = []*types.Block{event.NewBlock}
 	} else {
-		newHeaders, err = s.p2pService.FetchHeaders(
-			ctx,
-			ccBuilder.Root().Number.Uint64(),
-			event.NewHeader.Number.Uint64()+1,
-			event.PeerId,
-		)
+		blocks, err := s.p2pService.FetchBlocks(ctx, rootNum, newBlockHeaderNum+1, event.PeerId)
 		if err != nil {
+			if (p2p.ErrIncompleteHeaders{}).Is(err) || (p2p.ErrMissingBodies{}).Is(err) {
+				s.logger.Debug(
+					syncLogPrefix("onNewBlockEvent: failed to fetch complete blocks, ignoring event"),
+					"err", err,
+					"peerId", event.PeerId,
+					"lastBlockNum", newBlockHeaderNum,
+				)
+
+				return nil
+			}
+
 			return err
 		}
+
+		newBlocks = blocks.Data
+	}
+
+	if err := s.blocksVerifier(newBlocks); err != nil {
+		s.logger.Debug(syncLogPrefix("onNewBlockEvent: invalid new block event from peer, penalizing and ignoring"), "err", err)
+
+		if err = s.p2pService.Penalize(ctx, event.PeerId); err != nil {
+			s.logger.Debug(syncLogPrefix("onNewBlockEvent: issue with penalizing peer"), "err", err)
+		}
+
+		return nil
+	}
+
+	newHeaders := make([]*types.Header, len(newBlocks))
+	for i, block := range newBlocks {
+		newHeaders[i] = block.HeaderNoCopy()
 	}
 
 	oldTip := ccBuilder.Tip()
 	if err = ccBuilder.Connect(newHeaders); err != nil {
-		s.logger.Debug("sync.Sync.onNewHeaderEvent: couldn't connect a header to the local chain tip, ignoring", "err", err)
+		s.logger.Debug(syncLogPrefix("onNewBlockEvent: couldn't connect a header to the local chain tip, ignoring"), "err", err)
 		return nil
 	}
-	newTip := ccBuilder.Tip()
 
+	newTip := ccBuilder.Tip()
 	if newTip != oldTip {
-		if err = s.execution.InsertBlocks(ctx, newHeaders); err != nil {
+		if err = s.execution.InsertBlocks(ctx, newBlocks); err != nil {
 			return err
 		}
 
@@ -150,32 +197,38 @@ func (s *Sync) onNewHeaderEvent(
 	return nil
 }
 
-func (s *Sync) onNewHeaderHashesEvent(
+func (s *Sync) onNewBlockHashesEvent(
 	ctx context.Context,
-	event EventNewHeaderHashes,
+	event EventNewBlockHashes,
 	ccBuilder CanonicalChainBuilder,
 ) error {
-	for _, headerHashNum := range event.NewHeaderHashes {
+	for _, headerHashNum := range event.NewBlockHashes {
 		if (headerHashNum.Number <= ccBuilder.Root().Number.Uint64()) || ccBuilder.ContainsHash(headerHashNum.Hash) {
 			continue
 		}
 
-		newHeaders, err := s.p2pService.FetchHeaders(
-			ctx,
-			headerHashNum.Number,
-			headerHashNum.Number+1,
-			event.PeerId,
-		)
+		newBlocks, err := s.p2pService.FetchBlocks(ctx, headerHashNum.Number, headerHashNum.Number+1, event.PeerId)
 		if err != nil {
+			if (p2p.ErrIncompleteHeaders{}).Is(err) || (p2p.ErrMissingBodies{}).Is(err) {
+				s.logger.Debug(
+					syncLogPrefix("onNewBlockHashesEvent: failed to fetch complete blocks, ignoring event"),
+					"err", err,
+					"peerId", event.PeerId,
+					"lastBlockNum", headerHashNum.Number,
+				)
+
+				continue
+			}
+
 			return err
 		}
 
-		newHeaderEvent := EventNewHeader{
-			NewHeader: newHeaders[0],
-			PeerId:    event.PeerId,
+		newBlockEvent := EventNewBlock{
+			NewBlock: newBlocks.Data[0],
+			PeerId:   event.PeerId,
 		}
 
-		err = s.onNewHeaderEvent(ctx, newHeaderEvent, ccBuilder)
+		err = s.onNewBlockEvent(ctx, newBlockEvent, ccBuilder)
 		if err != nil {
 			return err
 		}
@@ -183,35 +236,28 @@ func (s *Sync) onNewHeaderHashesEvent(
 	return nil
 }
 
+//
+// TODO (subsequent PRs) - unit test initial sync + on new event cases
+//
+
 func (s *Sync) Run(ctx context.Context) error {
-	tip, err := s.execution.CurrentHeader(ctx)
+	s.logger.Debug(syncLogPrefix("running sync component"))
+
+	tip, err := s.syncToTip(ctx)
 	if err != nil {
 		return err
 	}
 
-	if newTip, err := s.downloader.DownloadUsingCheckpoints(ctx, tip.Number.Uint64()); err != nil {
-		return err
-	} else if newTip != nil {
-		tip = newTip
-	}
-
-	if newTip, err := s.downloader.DownloadUsingMilestones(ctx, tip.Number.Uint64()); err != nil {
-		return err
-	} else if newTip != nil {
-		tip = newTip
-	}
-
-	if err = s.commitExecution(ctx, tip, tip); err != nil {
-		return err
-	}
-
-	latestSpan, err := s.fetchLatestSpan(ctx)
+	latestSpans, err := s.fetchLatestSpans(ctx, 2)
 	if err != nil {
 		return err
 	}
-	s.spansCache.Add(latestSpan)
 
-	ccBuilder := s.ccBuilderFactory(tip, latestSpan)
+	for _, span := range latestSpans {
+		s.spansCache.Add(span)
+	}
+
+	ccBuilder := s.ccBuilderFactory(tip)
 
 	for {
 		select {
@@ -221,12 +267,12 @@ func (s *Sync) Run(ctx context.Context) error {
 				if err = s.onMilestoneEvent(ctx, event.AsNewMilestone(), ccBuilder); err != nil {
 					return err
 				}
-			case EventTypeNewHeader:
-				if err = s.onNewHeaderEvent(ctx, event.AsNewHeader(), ccBuilder); err != nil {
+			case EventTypeNewBlock:
+				if err = s.onNewBlockEvent(ctx, event.AsNewBlock(), ccBuilder); err != nil {
 					return err
 				}
-			case EventTypeNewHeaderHashes:
-				if err = s.onNewHeaderHashesEvent(ctx, event.AsNewHeaderHashes(), ccBuilder); err != nil {
+			case EventTypeNewBlockHashes:
+				if err = s.onNewBlockHashesEvent(ctx, event.AsNewBlockHashes(), ccBuilder); err != nil {
 					return err
 				}
 			case EventTypeNewSpan:
@@ -236,4 +282,60 @@ func (s *Sync) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+}
+
+func (s *Sync) syncToTip(ctx context.Context) (*types.Header, error) {
+	tip, err := s.execution.CurrentHeader(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	tip, err = s.syncToTipUsingCheckpoints(ctx, tip)
+	if err != nil {
+		return nil, err
+	}
+
+	tip, err = s.syncToTipUsingMilestones(ctx, tip)
+	if err != nil {
+		return nil, err
+	}
+
+	return tip, nil
+}
+
+func (s *Sync) syncToTipUsingCheckpoints(ctx context.Context, tip *types.Header) (*types.Header, error) {
+	return s.sync(ctx, tip, func(ctx context.Context, startBlockNum uint64) (*types.Header, error) {
+		return s.blockDownloader.DownloadBlocksUsingCheckpoints(ctx, startBlockNum)
+	})
+}
+
+func (s *Sync) syncToTipUsingMilestones(ctx context.Context, tip *types.Header) (*types.Header, error) {
+	return s.sync(ctx, tip, func(ctx context.Context, startBlockNum uint64) (*types.Header, error) {
+		return s.blockDownloader.DownloadBlocksUsingMilestones(ctx, startBlockNum)
+	})
+}
+
+func (s *Sync) sync(
+	ctx context.Context,
+	tip *types.Header,
+	tipDownloader func(ctx context.Context, startBlockNum uint64) (*types.Header, error),
+) (*types.Header, error) {
+	for {
+		newTip, err := tipDownloader(ctx, tip.Number.Uint64()+1)
+		if err != nil {
+			return nil, err
+		}
+
+		if newTip == nil {
+			// we've reached the tip
+			break
+		}
+
+		tip = newTip
+		if err = s.commitExecution(ctx, tip, tip); err != nil {
+			return nil, err
+		}
+	}
+
+	return tip, nil
 }

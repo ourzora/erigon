@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: AutoModality/action-clean@v1
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # fetch git tags for "git describe"
 
@@ -38,7 +38,7 @@ jobs:
           done
 
       - name: parse hive results
-        uses: phoenix-actions/test-reporting@v10
+        uses: phoenix-actions/test-reporting@v15
         with:
           name: Tests
           path: results-${{ github.run_id }}/*.xml

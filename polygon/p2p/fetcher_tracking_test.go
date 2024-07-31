@@ -1,3 +1,19 @@
+// Copyright 2024 The Erigon Authors
+// This file is part of Erigon.
+//
+// Erigon is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Erigon is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with Erigon. If not, see <http://www.gnu.org/licenses/>.
+
 package p2p
 
 import (
@@ -8,9 +24,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/ledgerwatch/erigon-lib/common"
-	"github.com/ledgerwatch/erigon-lib/gointerfaces/sentry"
-	"github.com/ledgerwatch/erigon/core/types"
+	"github.com/erigontech/erigon-lib/common"
+	sentry "github.com/erigontech/erigon-lib/gointerfaces/sentryproto"
+	"github.com/erigontech/erigon/core/types"
 )
 
 func TestTrackingFetcherFetchHeadersUpdatesPeerTracker(t *testing.T) {
@@ -59,10 +75,11 @@ func TestTrackingFetcherFetchHeadersUpdatesPeerTracker(t *testing.T) {
 		}, time.Second, 100*time.Millisecond, "expected number of initial peers never satisfied: want=2, have=%d", len(peerIds))
 
 		headers, err := test.trackingFetcher.FetchHeaders(ctx, 1, 3, peerId1) // fetch headers 1 and 2
+		headersData := headers.Data
 		require.NoError(t, err)
-		require.Len(t, headers, 2)
-		require.Equal(t, uint64(1), headers[0].Number.Uint64())
-		require.Equal(t, uint64(2), headers[1].Number.Uint64())
+		require.Len(t, headersData, 2)
+		require.Equal(t, uint64(1), headersData[0].Number.Uint64())
+		require.Equal(t, uint64(2), headersData[1].Number.Uint64())
 
 		peerIds = test.peerTracker.ListPeersMayHaveBlockNum(4) // peers which may have blocks 1,2,3,4
 		require.Len(t, peerIds, 2)
@@ -74,7 +91,7 @@ func TestTrackingFetcherFetchHeadersUpdatesPeerTracker(t *testing.T) {
 		require.Equal(t, uint64(2), errIncompleteHeaders.requested)
 		require.Equal(t, uint64(0), errIncompleteHeaders.received)
 		require.Equal(t, uint64(3), errIncompleteHeaders.LowestMissingBlockNum())
-		require.Nil(t, headers)
+		require.Nil(t, headers.Data)
 
 		// should be one peer less now given that we know that peer 1 does not have block num 4
 		peerIds = test.peerTracker.ListPeersMayHaveBlockNum(4)
@@ -145,14 +162,14 @@ func TestTrackingFetcherFetchBodiesUpdatesPeerTracker(t *testing.T) {
 
 		bodies, err := test.trackingFetcher.FetchBodies(ctx, mockHeaders, peerId1)
 		require.ErrorIs(t, err, &ErrMissingBodies{})
-		require.Nil(t, bodies)
+		require.Nil(t, bodies.Data)
 
 		peerIds = test.peerTracker.ListPeersMayHaveBlockNum(1) // only peerId2 may have block 1, peerId does not
 		require.Len(t, peerIds, 1)
 
 		bodies, err = test.trackingFetcher.FetchBodies(ctx, mockHeaders, peerId2)
 		require.ErrorIs(t, err, context.DeadlineExceeded)
-		require.Nil(t, bodies)
+		require.Nil(t, bodies.Data)
 
 		peerIds = test.peerTracker.ListPeersMayHaveBlockNum(1) // neither peerId1 nor peerId2 have block num 1
 		require.Len(t, peerIds, 0)
@@ -161,8 +178,9 @@ func TestTrackingFetcherFetchBodiesUpdatesPeerTracker(t *testing.T) {
 
 func newTrackingFetcherTest(t *testing.T, requestIdGenerator RequestIdGenerator) *trackingFetcherTest {
 	fetcherTest := newFetcherTest(t, requestIdGenerator)
-	peerTracker := NewPeerTracker()
-	unregister := fetcherTest.messageListener.RegisterPeerEventObserver(NewPeerEventObserver(peerTracker))
+	logger := fetcherTest.logger
+	peerTracker := newPeerTracker(PreservingPeerShuffle)
+	unregister := fetcherTest.messageListener.RegisterPeerEventObserver(NewPeerEventObserver(logger, peerTracker))
 	t.Cleanup(unregister)
 	trackingFetcher := newTrackingFetcher(fetcherTest.fetcher, peerTracker)
 	return &trackingFetcherTest{

@@ -1,21 +1,44 @@
+// Copyright 2024 The Erigon Authors
+// This file is part of Erigon.
+//
+// Erigon is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Erigon is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with Erigon. If not, see <http://www.gnu.org/licenses/>.
+
 package eth1_chain_reader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"time"
 
-	"github.com/ledgerwatch/log/v3"
 	"google.golang.org/protobuf/types/known/emptypb"
 
-	"github.com/ledgerwatch/erigon-lib/chain"
-	libcommon "github.com/ledgerwatch/erigon-lib/common"
-	"github.com/ledgerwatch/erigon-lib/gointerfaces"
-	"github.com/ledgerwatch/erigon-lib/gointerfaces/execution"
-	types2 "github.com/ledgerwatch/erigon-lib/gointerfaces/types"
-	"github.com/ledgerwatch/erigon/core/types"
-	"github.com/ledgerwatch/erigon/turbo/execution/eth1/eth1_utils"
+	"github.com/erigontech/erigon-lib/log/v3"
+
+	"github.com/erigontech/erigon-lib/chain"
+	libcommon "github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/gointerfaces"
+	execution "github.com/erigontech/erigon-lib/gointerfaces/executionproto"
+	types2 "github.com/erigontech/erigon-lib/gointerfaces/typesproto"
+	"github.com/erigontech/erigon/cl/clparams"
+	"github.com/erigontech/erigon/cl/cltypes"
+	"github.com/erigontech/erigon/cl/cltypes/solid"
+	"github.com/erigontech/erigon/cl/utils"
+	"github.com/erigontech/erigon/core/types"
+	"github.com/erigontech/erigon/turbo/engineapi/engine_types"
+	"github.com/erigontech/erigon/turbo/execution/eth1/eth1_utils"
 )
 
 type ChainReaderWriterEth1 struct {
@@ -102,7 +125,7 @@ func (c ChainReaderWriterEth1) GetBlockByHash(ctx context.Context, hash libcommo
 		log.Warn("[engine] GetBlockByHash", "err", err)
 		return nil
 	}
-	return types.NewBlock(header, txs, nil, nil, body.Withdrawals)
+	return types.NewBlock(header, txs, nil, nil, body.Withdrawals, body.Requests)
 }
 
 func (c ChainReaderWriterEth1) GetBlockByNumber(ctx context.Context, number uint64) *types.Block {
@@ -131,7 +154,7 @@ func (c ChainReaderWriterEth1) GetBlockByNumber(ctx context.Context, number uint
 		log.Warn("[engine] GetBlockByNumber", "err", err)
 		return nil
 	}
-	return types.NewBlock(header, txs, nil, nil, body.Withdrawals)
+	return types.NewBlock(header, txs, nil, nil, body.Withdrawals, body.Requests)
 }
 
 func (c ChainReaderWriterEth1) GetHeaderByHash(ctx context.Context, hash libcommon.Hash) *types.Header {
@@ -258,15 +281,13 @@ func (c ChainReaderWriterEth1) IsCanonicalHash(ctx context.Context, hash libcomm
 	return resp.Canonical, nil
 }
 
-func (c ChainReaderWriterEth1) FrozenBlocks(ctx context.Context) uint64 {
+func (c ChainReaderWriterEth1) FrozenBlocks(ctx context.Context) (uint64, bool) {
 	ret, err := c.executionModule.FrozenBlocks(ctx, &emptypb.Empty{})
 	if err != nil {
 		panic(err)
 	}
-	return ret.FrozenBlocks
+	return ret.FrozenBlocks, ret.HasGap
 }
-
-const retryTimeout = 10 * time.Millisecond
 
 func (c ChainReaderWriterEth1) InsertBlocksAndWait(ctx context.Context, blocks []*types.Block) error {
 	request := &execution.InsertBlocksRequest{
@@ -276,22 +297,22 @@ func (c ChainReaderWriterEth1) InsertBlocksAndWait(ctx context.Context, blocks [
 	if err != nil {
 		return err
 	}
-	retryInterval := time.NewTicker(retryTimeout)
-	defer retryInterval.Stop()
 
 	for response.Result == execution.ExecutionStatus_Busy {
+		const retryDelay = 100 * time.Millisecond
 		select {
-		case <-retryInterval.C:
-			response, err = c.executionModule.InsertBlocks(ctx, request)
-			if err != nil {
-				return err
-			}
+		case <-time.After(retryDelay):
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+
+		response, err = c.executionModule.InsertBlocks(ctx, request)
+		if err != nil {
+			return err
+		}
 	}
 	if response.Result != execution.ExecutionStatus_Success {
-		return fmt.Errorf("insertHeadersAndWait: invalid code recieved from execution module: %s", response.Result.String())
+		return fmt.Errorf("InsertBlocksAndWait: executionModule.InsertBlocks ExecutionStatus = %s", response.Result.String())
 	}
 	return nil
 }
@@ -316,31 +337,7 @@ func (c ChainReaderWriterEth1) InsertBlocks(ctx context.Context, blocks []*types
 
 func (c ChainReaderWriterEth1) InsertBlockAndWait(ctx context.Context, block *types.Block) error {
 	blocks := []*types.Block{block}
-	request := &execution.InsertBlocksRequest{
-		Blocks: eth1_utils.ConvertBlocksToRPC(blocks),
-	}
-
-	response, err := c.executionModule.InsertBlocks(ctx, request)
-	if err != nil {
-		return err
-	}
-	retryInterval := time.NewTicker(retryTimeout)
-	defer retryInterval.Stop()
-	for response.Result == execution.ExecutionStatus_Busy {
-		select {
-		case <-retryInterval.C:
-			response, err = c.executionModule.InsertBlocks(ctx, request)
-			if err != nil {
-				return err
-			}
-		case <-ctx.Done():
-			return context.Canceled
-		}
-	}
-	if response.Result != execution.ExecutionStatus_Success {
-		return fmt.Errorf("insertHeadersAndWait: invalid code recieved from execution module: %s", response.Result.String())
-	}
-	return c.InsertBlocksAndWait(ctx, []*types.Block{block})
+	return c.InsertBlocksAndWait(ctx, blocks)
 }
 
 func (c ChainReaderWriterEth1) ValidateChain(ctx context.Context, hash libcommon.Hash, number uint64) (execution.ExecutionStatus, *string, libcommon.Hash, error) {
@@ -384,4 +381,94 @@ func (c ChainReaderWriterEth1) GetForkChoice(ctx context.Context) (headHash, fin
 	}
 	return gointerfaces.ConvertH256ToHash(resp.HeadBlockHash), gointerfaces.ConvertH256ToHash(resp.FinalizedBlockHash),
 		gointerfaces.ConvertH256ToHash(resp.SafeBlockHash), nil
+}
+
+func (c ChainReaderWriterEth1) HasBlock(ctx context.Context, hash libcommon.Hash) (bool, error) {
+	resp, err := c.executionModule.HasBlock(ctx, &execution.GetSegmentRequest{
+		BlockHash: gointerfaces.ConvertHashToH256(hash),
+	})
+	if err != nil {
+		return false, err
+	}
+	return resp.HasBlock, nil
+}
+
+func (c ChainReaderWriterEth1) AssembleBlock(baseHash libcommon.Hash, attributes *engine_types.PayloadAttributes) (id uint64, err error) {
+	request := &execution.AssembleBlockRequest{
+		Timestamp:             uint64(attributes.Timestamp),
+		PrevRandao:            gointerfaces.ConvertHashToH256(attributes.PrevRandao),
+		SuggestedFeeRecipient: gointerfaces.ConvertAddressToH160(attributes.SuggestedFeeRecipient),
+		Withdrawals:           eth1_utils.ConvertWithdrawalsToRpc(attributes.Withdrawals),
+		ParentHash:            gointerfaces.ConvertHashToH256(baseHash),
+	}
+	if attributes.ParentBeaconBlockRoot != nil {
+		request.ParentBeaconBlockRoot = gointerfaces.ConvertHashToH256(*attributes.ParentBeaconBlockRoot)
+	}
+	resp, err := c.executionModule.AssembleBlock(context.Background(), request)
+	if err != nil {
+		return 0, err
+	}
+	if resp.Busy {
+		return 0, errors.New("execution data is still syncing")
+	}
+	return resp.Id, nil
+}
+
+func (c ChainReaderWriterEth1) GetAssembledBlock(id uint64) (*cltypes.Eth1Block, *engine_types.BlobsBundleV1, *big.Int, error) {
+	resp, err := c.executionModule.GetAssembledBlock(context.Background(), &execution.GetAssembledBlockRequest{
+		Id: id,
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if resp.Busy {
+		return nil, nil, nil, errors.New("execution data is still syncing")
+	}
+	if resp.Data == nil {
+		return nil, nil, nil, nil
+	}
+
+	bundle := engine_types.ConvertBlobsFromRpc(resp.Data.BlobsBundle)
+	blockValue := gointerfaces.ConvertH256ToUint256Int(resp.Data.BlockValue).ToBig()
+	payloadRpc := resp.Data.ExecutionPayload
+
+	extraData := solid.NewExtraData()
+	extraData.SetBytes(payloadRpc.ExtraData)
+	blockHash := gointerfaces.ConvertH256ToHash(payloadRpc.BlockHash)
+	block := &cltypes.Eth1Block{
+		ParentHash:    gointerfaces.ConvertH256ToHash(payloadRpc.ParentHash),
+		FeeRecipient:  gointerfaces.ConvertH160toAddress(payloadRpc.Coinbase),
+		StateRoot:     gointerfaces.ConvertH256ToHash(payloadRpc.StateRoot),
+		ReceiptsRoot:  gointerfaces.ConvertH256ToHash(payloadRpc.ReceiptRoot),
+		LogsBloom:     gointerfaces.ConvertH2048ToBloom(payloadRpc.LogsBloom),
+		BlockNumber:   payloadRpc.BlockNumber,
+		GasLimit:      payloadRpc.GasLimit,
+		GasUsed:       payloadRpc.GasUsed,
+		Time:          payloadRpc.Timestamp,
+		Extra:         extraData,
+		PrevRandao:    gointerfaces.ConvertH256ToHash(payloadRpc.PrevRandao),
+		Transactions:  solid.NewTransactionsSSZFromTransactions(payloadRpc.Transactions),
+		BlockHash:     blockHash,
+		BaseFeePerGas: gointerfaces.ConvertH256ToHash(payloadRpc.BaseFeePerGas),
+	}
+	copy(block.BaseFeePerGas[:], utils.ReverseOfByteSlice(block.BaseFeePerGas[:])) // reverse the byte slice
+	if payloadRpc.ExcessBlobGas != nil {
+		block.ExcessBlobGas = *payloadRpc.ExcessBlobGas
+	}
+	if payloadRpc.BlobGasUsed != nil {
+		block.BlobGasUsed = *payloadRpc.BlobGasUsed
+	}
+
+	// change the limit later
+	withdrawals := solid.NewStaticListSSZ[*cltypes.Withdrawal](int(clparams.MainnetBeaconConfig.MaxWithdrawalsPerPayload), 44)
+	for _, w := range payloadRpc.Withdrawals {
+		withdrawals.Append(&cltypes.Withdrawal{
+			Amount:    w.Amount,
+			Address:   gointerfaces.ConvertH160toAddress(w.Address),
+			Index:     w.Index,
+			Validator: w.ValidatorIndex,
+		})
+	}
+	block.Withdrawals = withdrawals
+	return block, bundle, blockValue, nil
 }

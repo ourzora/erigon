@@ -1,14 +1,30 @@
+// Copyright 2024 The Erigon Authors
+// This file is part of Erigon.
+//
+// Erigon is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Erigon is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with Erigon. If not, see <http://www.gnu.org/licenses/>.
+
 package forkchoice
 
 import (
-	"fmt"
+	"errors"
 
-	"github.com/ledgerwatch/erigon/cl/transition"
+	"github.com/erigontech/erigon/cl/transition"
 
-	libcommon "github.com/ledgerwatch/erigon-lib/common"
-	"github.com/ledgerwatch/erigon/cl/cltypes/solid"
-	"github.com/ledgerwatch/erigon/cl/phase1/core/state"
-	"github.com/ledgerwatch/log/v3"
+	libcommon "github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/cl/cltypes/solid"
+	"github.com/erigontech/erigon/cl/phase1/core/state"
 )
 
 // Slot calculates the current slot number using the time and genesis slot.
@@ -46,18 +62,7 @@ func (f *ForkChoiceStore) onNewFinalized(newFinalized solid.Checkpoint) {
 		}
 		return true
 	})
-	f.publicKeysPerState.Range(func(k, v any) bool {
-		h := k.(libcommon.Hash)
-		header, ok := f.GetHeader(h)
-		if !ok {
-			log.Debug("onNewFinalized: header not found", "hash", h)
-			return true
-		}
-		if header.Slot <= newFinalized.Epoch()*f.beaconCfg.SlotsPerEpoch {
-			f.publicKeysPerState.Delete(k)
-		}
-		return true
-	})
+
 	f.forkGraph.Prune(newFinalized.Epoch() * f.beaconCfg.SlotsPerEpoch)
 }
 
@@ -119,7 +124,7 @@ func (f *ForkChoiceStore) getCheckpointState(checkpoint solid.Checkpoint) (*chec
 		return nil, err
 	}
 	if baseState == nil {
-		return nil, fmt.Errorf("getCheckpointState: baseState not found in graph")
+		return nil, errors.New("getCheckpointState: baseState not found in graph")
 	}
 	// By default use the no change encoding to signal that there is no future epoch here.
 	if baseState.Slot() < f.computeStartSlotAtEpoch(checkpoint.Epoch()) {

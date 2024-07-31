@@ -1,3 +1,19 @@
+// Copyright 2024 The Erigon Authors
+// This file is part of Erigon.
+//
+// Erigon is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Erigon is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with Erigon. If not, see <http://www.gnu.org/licenses/>.
+
 package p2p
 
 import (
@@ -5,9 +21,9 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/ledgerwatch/log/v3"
+	"github.com/erigontech/erigon-lib/log/v3"
 
-	"github.com/ledgerwatch/erigon/core/types"
+	"github.com/erigontech/erigon/core/types"
 )
 
 func NewPenalizingFetcher(logger log.Logger, fetcher Fetcher, peerPenalizer PeerPenalizer) Fetcher {
@@ -28,19 +44,19 @@ type penalizingFetcher struct {
 	peerPenalizer PeerPenalizer
 }
 
-func (pf *penalizingFetcher) FetchHeaders(ctx context.Context, start uint64, end uint64, peerId *PeerId) ([]*types.Header, error) {
+func (pf *penalizingFetcher) FetchHeaders(ctx context.Context, start uint64, end uint64, peerId *PeerId) (FetcherResponse[[]*types.Header], error) {
 	headers, err := pf.Fetcher.FetchHeaders(ctx, start, end, peerId)
 	if err != nil {
-		return nil, pf.maybePenalize(ctx, peerId, err, &ErrTooManyHeaders{}, &ErrNonSequentialHeaderNumbers{})
+		return FetcherResponse[[]*types.Header]{}, pf.maybePenalize(ctx, peerId, err, &ErrTooManyHeaders{}, &ErrNonSequentialHeaderNumbers{})
 	}
 
 	return headers, nil
 }
 
-func (pf *penalizingFetcher) FetchBodies(ctx context.Context, headers []*types.Header, peerId *PeerId) ([]*types.Body, error) {
+func (pf *penalizingFetcher) FetchBodies(ctx context.Context, headers []*types.Header, peerId *PeerId) (FetcherResponse[[]*types.Body], error) {
 	bodies, err := pf.Fetcher.FetchBodies(ctx, headers, peerId)
 	if err != nil {
-		return nil, pf.maybePenalize(ctx, peerId, err, ErrEmptyBody)
+		return FetcherResponse[[]*types.Body]{}, pf.maybePenalize(ctx, peerId, err, &ErrTooManyBodies{})
 	}
 
 	return bodies, nil
@@ -56,10 +72,13 @@ func (pf *penalizingFetcher) maybePenalize(ctx context.Context, peerId *PeerId, 
 	}
 
 	if shouldPenalize {
-		pf.logger.Debug("penalizing peer", "peerId", peerId, "err", err)
+		pf.logger.Debug(
+			"[p2p.penalizing.fetcher] penalizing peer - penalize-able fetcher issue",
+			"peerId", peerId,
+			"err", err,
+		)
 
-		penalizeErr := pf.peerPenalizer.Penalize(ctx, peerId)
-		if penalizeErr != nil {
+		if penalizeErr := pf.peerPenalizer.Penalize(ctx, peerId); penalizeErr != nil {
 			err = fmt.Errorf("%w: %w", penalizeErr, err)
 		}
 	}

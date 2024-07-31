@@ -1,10 +1,27 @@
+// Copyright 2024 The Erigon Authors
+// This file is part of Erigon.
+//
+// Erigon is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Erigon is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with Erigon. If not, see <http://www.gnu.org/licenses/>.
+
 package diagnostics
 
 import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/ledgerwatch/erigon/turbo/node"
+	diaglib "github.com/erigontech/erigon-lib/diagnostics"
+	"github.com/erigontech/erigon/turbo/node"
 	"github.com/urfave/cli/v2"
 )
 
@@ -35,7 +52,11 @@ type PeerResponse struct {
 	Protocols     map[string]interface{} `json:"protocols"` // Sub-protocol specific metadata fields
 }
 
-func SetupPeersAccess(ctxclient *cli.Context, metricsMux *http.ServeMux, node *node.ErigonNode, diag *DiagnosticClient) {
+func SetupPeersAccess(ctxclient *cli.Context, metricsMux *http.ServeMux, node *node.ErigonNode, diag *diaglib.DiagnosticClient) {
+	if metricsMux == nil {
+		return
+	}
+
 	metricsMux.HandleFunc("/peers", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Content-Type", "application/json")
@@ -43,14 +64,14 @@ func SetupPeersAccess(ctxclient *cli.Context, metricsMux *http.ServeMux, node *n
 	})
 }
 
-func writePeers(w http.ResponseWriter, ctx *cli.Context, node *node.ErigonNode, diag *DiagnosticClient) {
+func writePeers(w http.ResponseWriter, ctx *cli.Context, node *node.ErigonNode, diag *diaglib.DiagnosticClient) {
 	allPeers := peers(diag)
 	filteredPeers := filterPeersWithoutBytesIn(allPeers)
 
 	json.NewEncoder(w).Encode(filteredPeers)
 }
 
-func peers(diag *DiagnosticClient) []*PeerResponse {
+func peers(diag *diaglib.DiagnosticClient) []*PeerResponse {
 
 	statisticsArray := diag.Peers()
 	peers := make([]*PeerResponse, 0, len(statisticsArray))

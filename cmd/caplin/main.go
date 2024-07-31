@@ -1,13 +1,18 @@
-// Copyright 2022 Erigon-Lightclient contributors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//     http://www.apache.org/licenses/LICENSE-2.0
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2022 The Erigon Authors
+// This file is part of Erigon.
+//
+// Erigon is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Erigon is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with Erigon. If not, see <http://www.gnu.org/licenses/>.
 
 package main
 
@@ -16,23 +21,28 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/ledgerwatch/erigon/cl/beacon/beacon_router_configuration"
-	"github.com/ledgerwatch/erigon/cl/persistence/db_config"
-	"github.com/ledgerwatch/erigon/cl/phase1/core"
-	"github.com/ledgerwatch/erigon/cl/phase1/core/state"
-	execution_client2 "github.com/ledgerwatch/erigon/cl/phase1/execution_client"
-	"github.com/ledgerwatch/erigon/eth/ethconfig"
-
-	"github.com/ledgerwatch/log/v3"
 	"github.com/urfave/cli/v2"
+	"golang.org/x/sync/semaphore"
 
-	"github.com/ledgerwatch/erigon/cmd/caplin/caplin1"
-	"github.com/ledgerwatch/erigon/cmd/caplin/caplincli"
-	"github.com/ledgerwatch/erigon/cmd/caplin/caplinflags"
-	"github.com/ledgerwatch/erigon/cmd/sentinel/sentinelflags"
-	"github.com/ledgerwatch/erigon/cmd/utils"
-	"github.com/ledgerwatch/erigon/turbo/app"
-	"github.com/ledgerwatch/erigon/turbo/debug"
+	"github.com/erigontech/erigon-lib/common/dbg"
+	"github.com/erigontech/erigon-lib/common/disk"
+	"github.com/erigontech/erigon-lib/common/mem"
+	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/cl/beacon/beacon_router_configuration"
+	"github.com/erigontech/erigon/cl/clparams"
+	"github.com/erigontech/erigon/cl/phase1/core"
+	"github.com/erigontech/erigon/cl/phase1/core/state"
+	execution_client2 "github.com/erigontech/erigon/cl/phase1/execution_client"
+	"github.com/erigontech/erigon/cl/utils/eth_clock"
+	"github.com/erigontech/erigon/eth/ethconfig"
+
+	"github.com/erigontech/erigon/cmd/caplin/caplin1"
+	"github.com/erigontech/erigon/cmd/caplin/caplincli"
+	"github.com/erigontech/erigon/cmd/caplin/caplinflags"
+	"github.com/erigontech/erigon/cmd/sentinel/sentinelflags"
+	"github.com/erigontech/erigon/cmd/utils"
+	"github.com/erigontech/erigon/turbo/app"
+	"github.com/erigontech/erigon/turbo/debug"
 )
 
 func main() {
@@ -52,7 +62,7 @@ func runCaplinNode(cliCtx *cli.Context) error {
 		log.Error("[Phase1] Could not initialize caplin", "err", err)
 		return err
 	}
-	if _, _, err := debug.Setup(cliCtx, true /* root logger */); err != nil {
+	if _, _, _, err := debug.Setup(cliCtx, true /* root logger */); err != nil {
 		return err
 	}
 	rcfg := beacon_router_configuration.RouterConfiguration{
@@ -72,6 +82,10 @@ func runCaplinNode(cliCtx *cli.Context) error {
 	log.Info("[Phase1]", "chain", cliCtx.String(utils.ChainFlag.Name))
 	log.Info("[Phase1] Running Caplin")
 
+	// setup periodic logging and prometheus updates
+	go mem.LogMemStats(cliCtx.Context, log.Root())
+	go disk.UpdateDiskStats(cliCtx.Context, log.Root())
+
 	// Either start from genesis or a checkpoint
 	ctx, cn := context.WithCancel(cliCtx.Context)
 	defer cn()
@@ -79,11 +93,13 @@ func runCaplinNode(cliCtx *cli.Context) error {
 	if cfg.InitialSync {
 		state = cfg.InitalState
 	} else {
-		state, err = core.RetrieveBeaconState(ctx, cfg.BeaconCfg, cfg.GenesisCfg, cfg.CheckpointUri)
+		state, err = core.RetrieveBeaconState(ctx, cfg.BeaconCfg, cfg.NetworkType)
 		if err != nil {
 			return err
 		}
 	}
+
+	ethClock := eth_clock.NewEthereumClock(state.GenesisTime(), state.GenesisValidatorsRoot(), cfg.BeaconCfg)
 
 	// sentinel, err := service.StartSentinelService(&sentinel.SentinelConfig{
 	// 	IpAddr:        cfg.Addr,
@@ -121,14 +137,30 @@ func runCaplinNode(cliCtx *cli.Context) error {
 		executionEngine = cc
 	}
 
-	indiciesDB, blobStorage, err := caplin1.OpenCaplinDatabase(ctx, db_config.DefaultDatabaseConfiguration, cfg.BeaconCfg, cfg.GenesisCfg, cfg.Dirs.CaplinIndexing, cfg.Dirs.CaplinBlobs, executionEngine, false, 100_000)
+	indiciesDB, blobStorage, err := caplin1.OpenCaplinDatabase(ctx, cfg.BeaconCfg, ethClock, cfg.Dirs.CaplinIndexing, cfg.Dirs.CaplinBlobs, executionEngine, false, 100_000)
 	if err != nil {
 		return err
 	}
 
+	blockSnapBuildSema := semaphore.NewWeighted(int64(dbg.BuildSnapshotAllowance))
+
+	var options []caplin1.CaplinOption
+	// builder option
+	if rcfg.Builder {
+		if cfg.MevRelayUrl == "" {
+			log.Warn("builder mode requires mev_relay_url, but it is not set. Skipping builder mode")
+			rcfg.Builder = false
+		} else {
+			log.Info("Starting with builder mode")
+			options = append(options, caplin1.WithBuilder(cfg.MevRelayUrl, cfg.BeaconCfg))
+		}
+	}
+
 	return caplin1.RunCaplinPhase1(ctx, executionEngine, &ethconfig.Config{
-		LightClientDiscoveryAddr:    cfg.Addr,
-		LightClientDiscoveryPort:    uint64(cfg.Port),
-		LightClientDiscoveryTCPPort: uint64(cfg.ServerTcpPort),
-	}, cfg.NetworkCfg, cfg.BeaconCfg, cfg.GenesisCfg, state, cfg.Dirs, rcfg, nil, nil, false, false, false, indiciesDB, blobStorage, nil)
+		CaplinDiscoveryAddr:    cfg.Addr,
+		CaplinDiscoveryPort:    uint64(cfg.Port),
+		CaplinDiscoveryTCPPort: uint64(cfg.ServerTcpPort),
+		BeaconRouter:           rcfg,
+		CaplinConfig:           clparams.CaplinConfig{},
+	}, cfg.NetworkCfg, cfg.BeaconCfg, ethClock, state, cfg.Dirs, nil, nil, indiciesDB, blobStorage, nil, blockSnapBuildSema, options...)
 }

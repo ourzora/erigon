@@ -1,3 +1,19 @@
+// Copyright 2024 The Erigon Authors
+// This file is part of Erigon.
+//
+// Erigon is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Erigon is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with Erigon. If not, see <http://www.gnu.org/licenses/>.
+
 package p2p
 
 import (
@@ -12,12 +28,12 @@ import (
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc"
 
-	"github.com/ledgerwatch/erigon-lib/common"
-	"github.com/ledgerwatch/erigon-lib/gointerfaces/sentry"
-	erigonlibtypes "github.com/ledgerwatch/erigon-lib/gointerfaces/types"
-	"github.com/ledgerwatch/erigon/core/types"
-	"github.com/ledgerwatch/erigon/eth/protocols/eth"
-	"github.com/ledgerwatch/erigon/rlp"
+	"github.com/erigontech/erigon-lib/common"
+	sentry "github.com/erigontech/erigon-lib/gointerfaces/sentryproto"
+	erigonlibtypes "github.com/erigontech/erigon-lib/gointerfaces/typesproto"
+	"github.com/erigontech/erigon/core/types"
+	"github.com/erigontech/erigon/eth/protocols/eth"
+	"github.com/erigontech/erigon/rlp"
 )
 
 func TestFetcherFetchHeaders(t *testing.T) {
@@ -54,10 +70,11 @@ func TestFetcherFetchHeaders(t *testing.T) {
 	test.mockSentryStreams(mockRequestResponse)
 	test.run(func(ctx context.Context, t *testing.T) {
 		headers, err := test.fetcher.FetchHeaders(ctx, 1, 3, peerId)
+		headersData := headers.Data
 		require.NoError(t, err)
-		require.Len(t, headers, 2)
-		require.Equal(t, uint64(1), headers[0].Number.Uint64())
-		require.Equal(t, uint64(2), headers[1].Number.Uint64())
+		require.Len(t, headersData, 2)
+		require.Equal(t, uint64(1), headersData[0].Number.Uint64())
+		require.Equal(t, uint64(2), headersData[1].Number.Uint64())
 	})
 }
 
@@ -72,7 +89,7 @@ func TestFetcherFetchHeadersWithChunking(t *testing.T) {
 			Id:     sentry.MessageId_BLOCK_HEADERS_66,
 			PeerId: peerId.H512(),
 			// 1024 headers in first response
-			Data: blockHeadersPacket66Bytes(t, requestId1, mockHeaders[:1025]),
+			Data: blockHeadersPacket66Bytes(t, requestId1, mockHeaders[:1024]),
 		},
 	}
 	mockRequestResponse1 := requestResponseMock{
@@ -88,7 +105,7 @@ func TestFetcherFetchHeadersWithChunking(t *testing.T) {
 			Id:     sentry.MessageId_BLOCK_HEADERS_66,
 			PeerId: peerId.H512(),
 			// remaining 975 headers in second response
-			Data: blockHeadersPacket66Bytes(t, requestId2, mockHeaders[1025:]),
+			Data: blockHeadersPacket66Bytes(t, requestId2, mockHeaders[1024:]),
 		},
 	}
 	mockRequestResponse2 := requestResponseMock{
@@ -103,10 +120,11 @@ func TestFetcherFetchHeadersWithChunking(t *testing.T) {
 	test.mockSentryStreams(mockRequestResponse1, mockRequestResponse2)
 	test.run(func(ctx context.Context, t *testing.T) {
 		headers, err := test.fetcher.FetchHeaders(ctx, 1, 2000, peerId)
+		headersData := headers.Data
 		require.NoError(t, err)
-		require.Len(t, headers, 1999)
-		require.Equal(t, uint64(1), headers[0].Number.Uint64())
-		require.Equal(t, uint64(1999), headers[len(headers)-1].Number.Uint64())
+		require.Len(t, headersData, 1999)
+		require.Equal(t, uint64(1), headersData[0].Number.Uint64())
+		require.Equal(t, uint64(1999), headersData[len(headersData)-1].Number.Uint64())
 	})
 }
 
@@ -156,7 +174,7 @@ func TestFetcherFetchHeadersResponseTimeout(t *testing.T) {
 	test.run(func(ctx context.Context, t *testing.T) {
 		headers, err := test.fetcher.FetchHeaders(ctx, 1, 11, peerId)
 		require.ErrorIs(t, err, context.DeadlineExceeded)
-		require.Nil(t, headers)
+		require.Nil(t, headers.Data)
 	})
 }
 
@@ -171,7 +189,7 @@ func TestFetcherFetchHeadersResponseTimeoutRetrySuccess(t *testing.T) {
 			Id:     sentry.MessageId_BLOCK_HEADERS_66,
 			PeerId: peerId.H512(),
 			// 1024 headers in first response
-			Data: blockHeadersPacket66Bytes(t, requestId1, mockHeaders[:1025]),
+			Data: blockHeadersPacket66Bytes(t, requestId1, mockHeaders[:1024]),
 		},
 	}
 	mockRequestResponse1 := requestResponseMock{
@@ -205,7 +223,7 @@ func TestFetcherFetchHeadersResponseTimeoutRetrySuccess(t *testing.T) {
 			Id:     sentry.MessageId_BLOCK_HEADERS_66,
 			PeerId: peerId.H512(),
 			// remaining 975 headers in third response
-			Data: blockHeadersPacket66Bytes(t, requestId3, mockHeaders[1025:]),
+			Data: blockHeadersPacket66Bytes(t, requestId3, mockHeaders[1024:]),
 		},
 	}
 	mockRequestResponse3 := requestResponseMock{
@@ -220,10 +238,11 @@ func TestFetcherFetchHeadersResponseTimeoutRetrySuccess(t *testing.T) {
 	test.mockSentryStreams(mockRequestResponse1, mockRequestResponse2, mockRequestResponse3)
 	test.run(func(ctx context.Context, t *testing.T) {
 		headers, err := test.fetcher.FetchHeaders(ctx, 1, 2000, peerId)
+		headersData := headers.Data
 		require.NoError(t, err)
-		require.Len(t, headers, 1999)
-		require.Equal(t, uint64(1), headers[0].Number.Uint64())
-		require.Equal(t, uint64(1999), headers[len(headers)-1].Number.Uint64())
+		require.Len(t, headersData, 1999)
+		require.Equal(t, uint64(1), headersData[0].Number.Uint64())
+		require.Equal(t, uint64(1999), headersData[len(headersData)-1].Number.Uint64())
 	})
 }
 
@@ -238,7 +257,7 @@ func TestFetcherErrInvalidFetchHeadersRange(t *testing.T) {
 		require.ErrorAs(t, err, &errInvalidFetchHeadersRange)
 		require.Equal(t, uint64(3), errInvalidFetchHeadersRange.start)
 		require.Equal(t, uint64(1), errInvalidFetchHeadersRange.end)
-		require.Nil(t, headers)
+		require.Nil(t, headers.Data)
 	})
 }
 
@@ -246,30 +265,45 @@ func TestFetcherFetchHeadersErrIncompleteResponse(t *testing.T) {
 	t.Parallel()
 
 	peerId := PeerIdFromUint64(1)
-	requestId := uint64(1234)
-	mockInboundMessages := []*sentry.InboundMessage{
+	requestId1 := uint64(1234)
+	requestId2 := uint64(1235)
+	mockInboundMessages1 := []*sentry.InboundMessage{
 		{
 			Id:     sentry.MessageId_BLOCK_HEADERS_66,
 			PeerId: peerId.H512(),
-			Data:   newMockBlockHeadersPacket66Bytes(t, requestId, 2),
+			Data:   newMockBlockHeadersPacket66Bytes(t, requestId1, 2),
 		},
 	}
-	mockRequestResponse := requestResponseMock{
-		requestId:                   requestId,
-		mockResponseInboundMessages: mockInboundMessages,
+	mockInboundMessages2 := []*sentry.InboundMessage{
+		{
+			Id:     sentry.MessageId_BLOCK_HEADERS_66,
+			PeerId: peerId.H512(),
+			Data:   newMockBlockHeadersPacket66Bytes(t, requestId2, 0),
+		},
+	}
+	mockRequestResponse1 := requestResponseMock{
+		requestId:                   requestId1,
+		mockResponseInboundMessages: mockInboundMessages1,
 		wantRequestPeerId:           peerId,
 		wantRequestOriginNumber:     1,
 		wantRequestAmount:           3,
 	}
+	mockRequestResponse2 := requestResponseMock{
+		requestId:                   requestId2,
+		mockResponseInboundMessages: mockInboundMessages2,
+		wantRequestPeerId:           peerId,
+		wantRequestOriginNumber:     3,
+		wantRequestAmount:           1,
+	}
 
-	test := newFetcherTest(t, newMockRequestGenerator(requestId))
-	test.mockSentryStreams(mockRequestResponse)
+	test := newFetcherTest(t, newMockRequestGenerator(requestId1, requestId2))
+	test.mockSentryStreams(mockRequestResponse1, mockRequestResponse2)
 	test.run(func(ctx context.Context, t *testing.T) {
 		var errIncompleteHeaders *ErrIncompleteHeaders
 		headers, err := test.fetcher.FetchHeaders(ctx, 1, 4, peerId)
 		require.ErrorAs(t, err, &errIncompleteHeaders)
 		require.Equal(t, uint64(3), errIncompleteHeaders.LowestMissingBlockNum())
-		require.Nil(t, headers)
+		require.Nil(t, headers.Data)
 	})
 }
 
@@ -277,14 +311,22 @@ func TestFetcherFetchBodies(t *testing.T) {
 	t.Parallel()
 
 	peerId := PeerIdFromUint64(1)
-	requestId := uint64(1234)
-	mockHeaders := []*types.Header{{Number: big.NewInt(1)}}
-	mockHashes := []common.Hash{mockHeaders[0].Hash()}
-	mockInboundMessages := []*sentry.InboundMessage{
+	// setup 2 request to test "paging"-style fetch logic
+	requestId1 := uint64(1234)
+	requestId2 := uint64(1235)
+	mockHeaders := []*types.Header{
+		{Number: big.NewInt(1)},
+		{Number: big.NewInt(2)},
+	}
+	mockHashes := []common.Hash{
+		mockHeaders[0].Hash(),
+		mockHeaders[1].Hash(),
+	}
+	mockInboundMessages1 := []*sentry.InboundMessage{
 		{
 			Id:     sentry.MessageId_BLOCK_BODIES_66,
 			PeerId: peerId.H512(),
-			Data: newMockBlockBodiesPacketBytes(t, requestId, &types.Body{
+			Data: newMockBlockBodiesPacketBytes(t, requestId1, &types.Body{
 				Transactions: types.Transactions{
 					types.NewEIP1559Transaction(
 						*uint256.NewInt(1),
@@ -301,19 +343,48 @@ func TestFetcherFetchBodies(t *testing.T) {
 			}),
 		},
 	}
-	mockRequestResponse := requestResponseMock{
-		requestId:                   requestId,
-		mockResponseInboundMessages: mockInboundMessages,
+	mockRequestResponse1 := requestResponseMock{
+		requestId:                   requestId1,
+		mockResponseInboundMessages: mockInboundMessages1,
 		wantRequestPeerId:           peerId,
 		wantRequestHashes:           mockHashes,
 	}
+	mockInboundMessages2 := []*sentry.InboundMessage{
+		{
+			Id:     sentry.MessageId_BLOCK_BODIES_66,
+			PeerId: peerId.H512(),
+			Data: newMockBlockBodiesPacketBytes(t, requestId2, &types.Body{
+				Transactions: types.Transactions{
+					types.NewEIP1559Transaction(
+						*uint256.NewInt(1),
+						2,
+						common.BigToAddress(big.NewInt(321)),
+						uint256.NewInt(21),
+						0,
+						uint256.NewInt(987),
+						uint256.NewInt(876),
+						uint256.NewInt(765),
+						nil,
+					),
+				},
+			}),
+		},
+	}
+	mockRequestResponse2 := requestResponseMock{
+		requestId:                   requestId2,
+		mockResponseInboundMessages: mockInboundMessages2,
+		wantRequestPeerId:           peerId,
+		// 2nd time only request the remaining hash since the first one has been received
+		// in first batch
+		wantRequestHashes: mockHashes[1:],
+	}
 
-	test := newFetcherTest(t, newMockRequestGenerator(requestId))
-	test.mockSentryStreams(mockRequestResponse)
+	test := newFetcherTest(t, newMockRequestGenerator(requestId1, requestId2))
+	test.mockSentryStreams(mockRequestResponse1, mockRequestResponse2)
 	test.run(func(ctx context.Context, t *testing.T) {
 		bodies, err := test.fetcher.FetchBodies(ctx, mockHeaders, peerId)
 		require.NoError(t, err)
-		require.Len(t, bodies, 1)
+		require.Len(t, bodies.Data, 2)
 	})
 }
 
@@ -352,7 +423,7 @@ func TestFetcherFetchBodiesResponseTimeout(t *testing.T) {
 	test.run(func(ctx context.Context, t *testing.T) {
 		bodies, err := test.fetcher.FetchBodies(ctx, mockHeaders, peerId)
 		require.ErrorIs(t, err, context.DeadlineExceeded)
-		require.Nil(t, bodies)
+		require.Nil(t, bodies.Data)
 	})
 }
 
@@ -411,37 +482,7 @@ func TestFetcherFetchBodiesResponseTimeoutRetrySuccess(t *testing.T) {
 	test.run(func(ctx context.Context, t *testing.T) {
 		bodies, err := test.fetcher.FetchBodies(ctx, mockHeaders, peerId)
 		require.NoError(t, err)
-		require.Len(t, bodies, 1)
-	})
-}
-
-func TestFetcherFetchBodiesErrEmptyBody(t *testing.T) {
-	t.Parallel()
-
-	peerId := PeerIdFromUint64(1)
-	requestId := uint64(1234)
-	mockHeaders := []*types.Header{{Number: big.NewInt(1)}}
-	mockHashes := []common.Hash{mockHeaders[0].Hash()}
-	mockInboundMessages := []*sentry.InboundMessage{
-		{
-			Id:     sentry.MessageId_BLOCK_BODIES_66,
-			PeerId: peerId.H512(),
-			Data:   newMockBlockBodiesPacketBytes(t, requestId, &types.Body{}),
-		},
-	}
-	mockRequestResponse := requestResponseMock{
-		requestId:                   requestId,
-		mockResponseInboundMessages: mockInboundMessages,
-		wantRequestPeerId:           peerId,
-		wantRequestHashes:           mockHashes,
-	}
-
-	test := newFetcherTest(t, newMockRequestGenerator(requestId))
-	test.mockSentryStreams(mockRequestResponse)
-	test.run(func(ctx context.Context, t *testing.T) {
-		bodies, err := test.fetcher.FetchBodies(ctx, mockHeaders, peerId)
-		require.ErrorIs(t, err, ErrEmptyBody)
-		require.Nil(t, bodies)
+		require.Len(t, bodies.Data, 1)
 	})
 }
 
@@ -475,7 +516,7 @@ func TestFetcherFetchBodiesErrMissingBodies(t *testing.T) {
 		lowest, exists := errMissingBlocks.LowestMissingBlockNum()
 		require.Equal(t, uint64(1), lowest)
 		require.True(t, exists)
-		require.Nil(t, bodies)
+		require.Nil(t, bodies.Data)
 	})
 }
 
@@ -488,7 +529,7 @@ func newFetcherTest(t *testing.T, requestIdGenerator RequestIdGenerator) *fetche
 	messageListenerTest := newMessageListenerTest(t)
 	messageListener := messageListenerTest.messageListener
 	messageSender := NewMessageSender(messageListenerTest.sentryClient)
-	fetcher := newFetcher(fetcherConfig, messageListenerTest.logger, messageListener, messageSender, requestIdGenerator)
+	fetcher := newFetcher(fetcherConfig, messageListener, messageSender, requestIdGenerator)
 	return &fetcherTest{
 		messageListenerTest:         messageListenerTest,
 		fetcher:                     fetcher,

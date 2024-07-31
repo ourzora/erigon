@@ -1,3 +1,19 @@
+// Copyright 2024 The Erigon Authors
+// This file is part of Erigon.
+//
+// Erigon is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Erigon is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with Erigon. If not, see <http://www.gnu.org/licenses/>.
+
 package p2p
 
 import (
@@ -9,13 +25,16 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/ledgerwatch/erigon-lib/gointerfaces/sentry"
+	"github.com/erigontech/erigon-lib/log/v3"
+
+	sentry "github.com/erigontech/erigon-lib/gointerfaces/sentryproto"
+	"github.com/erigontech/erigon/turbo/testlog"
 )
 
 func TestPeerTracker(t *testing.T) {
 	t.Parallel()
 
-	peerTracker := newPeerTracker()
+	peerTracker := newPeerTracker(PreservingPeerShuffle)
 	peerIds := peerTracker.ListPeersMayHaveBlockNum(100)
 	require.Len(t, peerIds, 0)
 
@@ -48,8 +67,9 @@ func TestPeerTracker(t *testing.T) {
 func TestPeerTrackerPeerEventObserver(t *testing.T) {
 	t.Parallel()
 
-	peerTracker := newPeerTracker()
-	peerTrackerPeerEventObserver := NewPeerEventObserver(peerTracker)
+	logger := testlog.Logger(t, log.LvlInfo)
+	peerTracker := newPeerTracker(PreservingPeerShuffle)
+	peerTrackerPeerEventObserver := NewPeerEventObserver(logger, peerTracker)
 	messageListenerTest := newMessageListenerTest(t)
 	messageListenerTest.mockSentryStreams()
 	messageListenerTest.run(func(ctx context.Context, t *testing.T) {
